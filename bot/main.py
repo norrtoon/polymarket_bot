@@ -241,8 +241,25 @@ async def main():
     except Exception as _e:
         logger.error(f"Не удалось восстановить слежку: {_e}")
 
+    # Диагностика производительности: обе эти библиотеки влияют на
+    # скорость напрямую, а их отсутствие ничего не ломает — код просто
+    # молча работает в разы медленнее. Лучше видеть это в логе.
+    try:
+        from eth_keys.backends import get_default_backend_class
+        _ecc = get_default_backend_class().rsplit(".", 1)[-1]
+    except Exception:
+        _ecc = "неизвестен"
+
+    if "CoinCurve" not in _ecc:
+        logger.warning(
+            f"Подпись ордеров идёт через {_ecc} (чистый Python). "
+            f"Установите coincurve — подпись ускорится на порядки. "
+            f"Сейчас каждый ордер тратит на подпись десятки-сотни мс."
+        )
+
     logger.info(
-        f"Bot started (uvloop: {'да' if _UVLOOP else 'НЕТ — установите uvloop'})"
+        f"Bot started (uvloop: {'да' if _UVLOOP else 'НЕТ'}, "
+        f"подпись: {_ecc})"
     )
 
     try:

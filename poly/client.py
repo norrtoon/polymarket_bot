@@ -80,6 +80,7 @@ class PolymarketClient:
         # SecureClient на каждого пользователя (свои ключи у каждого)
         self._user_clients: dict = {}
         self._keepalive_task: asyncio.Task | None = None
+        self._warm_failed_logged = False
         # Счётчик полученных 429. Вотчер читает дельту и по ней
         # подстраивает интервал опроса под реальный лимит IP.
         self.rate_limit_events: int = 0
@@ -732,9 +733,20 @@ class PolymarketClient:
                 return
             await metadata.resolve_market(ctx, token_id=token_id)
         except Exception as e:
-            logger.debug(
-                f"warm_order_metadata пропущен: {type(e).__name__}: {e}"
-            )
+            # Раньше это писалось в debug и терялось. Но если прогрев не
+            # работает, SDK тянет метаданные рынка сам — синхронно
+            # внутри place_market_order, добавляя сетевой round-trip в
+            # критический путь. Молча терять такое нельзя, поэтому
+            # предупреждаем один раз, а дальше не шумим.
+            if not self._warm_failed_logged:
+                self._warm_failed_logged = True
+                logger.warning(
+                    f"Прогрев метаданных SDK не работает "
+                    f"({type(e).__name__}: {e}). Ордера будут медленнее: "
+                    f"SDK запросит метаданные сам во время отправки."
+                )
+            else:
+                logger.debug(f"warm_order_metadata: {e}")
 
     async def get_book_snapshot(self, token_id: str) -> dict:
         """
