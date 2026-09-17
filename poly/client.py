@@ -51,6 +51,16 @@ FALLBACK_POLYGON_RPCS = [
 ]
 
 
+def _require_side(item: dict) -> str:
+    """Сторона сделки строго из ответа API, без догадок."""
+    raw = (item.get("side") or "").strip().upper()
+    if raw in ("BUY", "SELL"):
+        return raw
+    raise ValueError(
+        f"в ответе Data API нет корректного поля side: {item.get('side')!r}"
+    )
+
+
 class PolymarketClient:
     """
     Гибридная интеграция:
@@ -342,7 +352,12 @@ class PolymarketClient:
                     market_id=item.get("conditionId", ""),
                     outcome_id=item.get("outcome", ""),
                     token_id=item.get("asset", item.get("tokenId", "")),
-                    side=item.get("side", "BUY").upper(),
+                    # side без молчаливого умолчания: если поле вдруг
+                    # отсутствует, подстановка "BUY" превратила бы
+                    # продажу трейдера в ПОКУПКУ — бот докупал бы там,
+                    # где нужно закрываться. Лучше пропустить запись и
+                    # увидеть это в логе.
+                    side=_require_side(item),
                     price=price,
                     size=size,
                     usdc_amount=price * size,

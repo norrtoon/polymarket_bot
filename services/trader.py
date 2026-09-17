@@ -619,6 +619,23 @@ class TraderService:
                         f"{current:.4f}), копируем"
                     )
 
+        # ---- Дальше идут проверки, осмысленные ТОЛЬКО для покупки ----
+        #
+        # Раньше они выполнялись и для продажи, из-за чего бот не мог
+        # закрывать позиции вслед за трейдером:
+        #   * лимит открытых позиций отклонял продажу, которая как раз
+        #     освободила бы слот (при MAX_OPEN_POSITIONS=1 блокировались
+        #     вообще все сделки после первой, включая перезаходы);
+        #   * проверка баланса требовала свободных USDC, хотя при
+        #     продаже мы деньги ПОЛУЧАЕМ, а не тратим;
+        #   * минимум в долях считался как ставка/цена, хотя продаём мы
+        #     shares_bought из позиции — другое число.
+        #
+        # Для продажи остаётся только проверка проскальзывания выше:
+        # она направленная и для SELL корректна.
+        if side != "BUY":
+            return None
+
         # 2a. Минимум площадки в долларах для рыночной покупки.
         # Биржа отклоняет marketable BUY меньше 1 USDC. Проверяем сами,
         # чтобы пользователь видел понятную причину, а не отказ биржи.
@@ -676,6 +693,34 @@ class TraderService:
                 f"максимум {settings.max_total_exposure}"
             )
         return None
+
+    async def _open_shares_for_token(
+        self, session, user_id: int, token_id: str
+    ) -> Decimal:
+        """
+        Сколько долей по этому токену у нас реально открыто.
+
+        Суммируем ВСЕ открытые позиции: перезаходы создают несколько
+        позиций по одному рынку, и когда трейдер выходит, закрывать
+        нужно весь объём. Если shares_bought где-то не сохранилось,
+        восстанавливаем из вложенной суммы и цены входа.
+        """
+        stmt = select(Position).where(
+            Position.user_id == user_id,
+            Position.token_id == token_id,
+            Position.status == "open",
+        )
+        positions = (await session.execute(stmt)).scalars().all()
+
+        total = Decimal("0")
+        for pos in positions:
+            shares = Decimal(str(pos.shares_bought or 0))
+            if shares <= 0:
+                entry = Decimal(str(pos.entry_price or 0))
+                if entry > 0:
+                    shares = Decimal(str(pos.amount_usdc or 0)) / entry
+            total += shares
+        return total
 
     async def _count_open_positions(
         self, session, user_id: int, token_id: str
@@ -785,6 +830,26 @@ class TraderService:
             ms_preflight = (time.monotonic() - t_phase) * 1000
             t_phase = time.monotonic()
 
+            # Для продажи нужно КОЛИЧЕСТВО ДОЛЕЙ, а не сумма.
+            #
+            # Раньше shares не передавался вовсе, и копирование продажи
+            # трейдера падало в place_market_order с "SELL без
+            # количества долей" — бот покупал вслед за кошельком, но
+            # закрыть позицию не мог. Берём фактический объём из своих
+            # открытых позиций по этому токену.
+            sell_shares = None
+            if side == "SELL":
+                sell_shares = await self._open_shares_for_token(
+                    session, user_id, token_id
+                )
+                if not sell_shares or sell_shares <= 0:
+                    logger.info(
+                        f"user={user_id}: трейдер продал "
+                        f"{token_id[:16]}..., но у нас нет открытой "
+                        f"позиции по этому рынку — копировать нечего"
+                    )
+                    return
+
             # СНАЧАЛА исполняем ордер — это критический путь
             result = await polymarket_client.place_market_order(
                 token_id=token_id,
@@ -792,6 +857,7 @@ class TraderService:
                 amount_usdc=amount,
                 price_hint=price_hint,
                 user=user,
+                shares=sell_shares,
             )
             ms_order = (time.monotonic() - t_phase) * 1000
             t_phase = time.monotonic()
