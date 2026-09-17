@@ -193,6 +193,9 @@ class TraderService:
         self._equity_cache: dict[int, tuple[Decimal, float]] = {}
         # Ограничения рынков (min_order_size, tick_size) — не меняются
         self._constraints_cache: dict[str, dict] = {}
+        # Цена из стакана, полученная в проверках — передаём её в
+        # ордер, чтобы SDK не запрашивал стакан ещё раз
+        self._last_book_price: dict[str, tuple] = {}
         # Фоновый прогрев капитала: задачи по user_id и период
         self._equity_tasks: dict[int, asyncio.Task] = {}
         self._equity_refresh_interval: float = 30.0
@@ -634,6 +637,9 @@ class TraderService:
         # Для продажи остаётся только проверка проскальзывания выше:
         # она направленная и для SELL корректна.
         if side != "BUY":
+            self._last_book_price[token_id] = (
+                book.get("best_bid"), time.monotonic()
+            )
             return None
 
         # 2a. Минимум площадки в долларах для рыночной покупки.
@@ -679,6 +685,10 @@ class TraderService:
                 )
 
         # 4. Ограничение общей экспозиции
+        self._last_book_price[token_id] = (
+            book.get("best_ask"), time.monotonic()
+        )
+
         row = exposure_row.one()
         open_count, open_sum = int(row[0] or 0), Decimal(str(row[1] or 0))
 
@@ -693,6 +703,16 @@ class TraderService:
                 f"максимум {settings.max_total_exposure}"
             )
         return None
+
+    def _book_price_for(self, token_id: str) -> Decimal | None:
+        """Цена из стакана, если она свежая (не старше 5 секунд)."""
+        entry = self._last_book_price.get(token_id)
+        if not entry:
+            return None
+        price, taken_at = entry
+        if price is None or time.monotonic() - taken_at > 5:
+            return None
+        return price
 
     async def _open_shares_for_token(
         self, session, user_id: int, token_id: str
@@ -858,6 +878,10 @@ class TraderService:
                 price_hint=price_hint,
                 user=user,
                 shares=sell_shares,
+                # Цена из стакана, уже полученная в проверках. Убирает
+                # повторный запрос стакана внутри SDK и служит защитой
+                # цены на стороне биржи.
+                limit_price=self._book_price_for(token_id),
             )
             ms_order = (time.monotonic() - t_phase) * 1000
             t_phase = time.monotonic()

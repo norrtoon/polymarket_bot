@@ -671,7 +671,7 @@ class PolymarketClient:
             )
         return warmed
 
-    async def start_connection_keepalive(self, interval: float = 120.0):
+    async def start_connection_keepalive(self, interval: float = 20.0):
         """
         Держать соединение с CLOB "горячим".
 
@@ -683,12 +683,18 @@ class PolymarketClient:
 
         Лёгкий периодический запрос не даёт соединению умереть, и
         ордер уходит по уже установленному каналу.
+
+        Интервал 20с выбран намеренно: у httpx внутри SDK
+        keepalive_expiry=30с, поэтому греть нужно чаще этого порога,
+        иначе соединение успевает закрыться между пингами.
         """
         if self._keepalive_task and not self._keepalive_task.done():
             return
 
         async def loop():
             while True:
+                # 1) Наш собственный пул aiohttp (используется для
+                #    /book, data-api, RPC).
                 try:
                     session = await self.http()
                     async with session.get(
@@ -697,7 +703,30 @@ class PolymarketClient:
                     ) as resp:
                         await resp.read()
                 except Exception as e:
-                    logger.debug(f"keepalive ping: {type(e).__name__}: {e}")
+                    logger.debug(f"keepalive aiohttp: {type(e).__name__}: {e}")
+
+                # 2) Пул httpx ВНУТРИ SDK — именно через него уходит
+                #    ордер, и это отдельный пул соединений.
+                #
+                #    Раньше грелся только наш aiohttp, а SDK-шное
+                #    соединение всё равно остывало: у него
+                #    keepalive_expiry=30с, а сделки приходят раз в
+                #    несколько минут. В результате КАЖДЫЙ ордер платил
+                #    полный TCP + TLS до Лондона, хотя keepalive
+                #    формально работал — просто грел не тот пул.
+                for user_id, client in list(self._user_clients.items()):
+                    try:
+                        ctx = getattr(client, "_ctx", None)
+                        clob = getattr(ctx, "clob", None)
+                        if clob is None:
+                            continue
+                        await clob.get_json("/time")
+                    except Exception as e:
+                        logger.debug(
+                            f"keepalive sdk user={user_id}: "
+                            f"{type(e).__name__}: {e}"
+                        )
+
                 await asyncio.sleep(interval)
 
         self._keepalive_task = asyncio.create_task(loop())
@@ -925,6 +954,7 @@ class PolymarketClient:
         price_hint: Decimal | None = None,
         user=None,
         shares: Decimal | None = None,
+        limit_price: Decimal | None = None,
     ) -> OrderResult:
         """
         Рыночный ордер.
@@ -992,6 +1022,17 @@ class PolymarketClient:
             # отдельные перегрузки):
             #   BUY  -> amount (сколько потратить) + max_spend
             #   SELL -> shares (сколько долей продать)
+            # Явная цена убирает ЛИШНИЙ сетевой запрос внутри SDK.
+            #
+            # Без неё SDK идёт по "незащищённой" ветке и сам тянет
+            # стакан, чтобы вычислить цену для подписи — это целый
+            # round-trip до Лондона внутри place_market_order. Но мы
+            # стакан УЖЕ получили в своих проверках, поэтому просто
+            # передаём цену: SDK берёт защищённую ветку и в сеть за
+            # стаканом не ходит.
+            #
+            # Побочная польза: max_price/min_price работают как защита
+            # цены на стороне биржи — ордер не исполнится хуже указанного.
             if order_side == "SELL":
                 if shares is None or shares <= 0:
                     return OrderResult(
@@ -1000,6 +1041,8 @@ class PolymarketClient:
                         error="SELL без количества долей",
                     )
                 order_kwargs = {"shares": float(shares)}
+                if limit_price and limit_price > 0:
+                    order_kwargs["min_price"] = float(limit_price)
             else:
                 # max_spend НЕ передаём.
                 #
@@ -1015,6 +1058,8 @@ class PolymarketClient:
                 # Передаём только amount: ставка уходит целиком,
                 # комиссии считаются сверх неё.
                 order_kwargs = {"amount": float(amount_usdc)}
+                if limit_price and limit_price > 0:
+                    order_kwargs["max_price"] = float(limit_price)
 
             response = await client.place_market_order(
                 token_id=token_id,
