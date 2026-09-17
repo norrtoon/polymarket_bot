@@ -1,0 +1,27 @@
+# Секреты — НИКОГДА не коммитить
+.env
+.env.backup
+.env.local
+*.key
+*.pem
+
+# База данных
+*.db
+*.sqlite
+*.sqlite3
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+venv/
+.venv/
+
+# Логи
+*.log
+logs/
+
+# IDE
+.vscode/
+.idea/
+.DS_Store
