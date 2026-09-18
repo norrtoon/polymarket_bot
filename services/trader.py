@@ -1031,16 +1031,21 @@ class TraderService:
         if not settings.simulation_mode:
             self._prefetch_book(token_id)
 
-        # Лок на (пользователь, токен): execute_copy_trade запускается
-        # через create_task, то есть сделки обрабатываются конкурентно.
-        # Лок нужен, чтобы номер перезахода считался корректно —
-        # иначе две одновременные сделки по одному токену обе увидят
-        # одинаковое количество открытых позиций и обе назовутся
-        # одним и тем же номером.
-        async with self._position_lock(user_id, token_id):
-            await self._execute_copy_trade_locked(
-                user_id, trade_data, side, token_id, copy_start_time
-            )
+        # Лок НЕ держим на весь путь.
+        #
+        # Раньше он охватывал всё исполнение целиком, включая отправку
+        # ордера. Из-за этого две сделки по ОДНОМУ рынку, пришедшие
+        # одновременно (например, вход и сразу перезаход трейдера),
+        # исполнялись строго по очереди: вторая ждала, пока первая
+        # полностью отработает вместе с сетевым запросом к бирже. В
+        # логах это выглядело как 2.2с и 2.5с на двух сделках одного
+        # рынка, хотя каждая сама по себе занимает доли секунды.
+        #
+        # Лок нужен только для корректной нумерации перезаходов, а это
+        # короткая операция с БД — её и защищаем, ниже по коду.
+        await self._execute_copy_trade_locked(
+            user_id, trade_data, side, token_id, copy_start_time
+        )
 
     async def _execute_copy_trade_locked(
         self,
@@ -1069,11 +1074,9 @@ class TraderService:
             # повторяет все новые сделки трейдера). Считаем, какой это
             # по счёту вход в данный рынок, чтобы пометить его в
             # уведомлении.
+            # Номер перезахода считается позже — непосредственно перед
+            # записью позиции, под коротким локом. Здесь он не нужен.
             entry_number = 1
-            if side == "BUY":
-                entry_number = await self._count_open_positions(
-                    session, user_id, token_id
-                ) + 1
 
             amount = await self._calculate_amount(user)
             if amount <= 0:
@@ -1094,9 +1097,13 @@ class TraderService:
             except Exception:
                 price_hint = None
 
-            # Разбивка по этапам: без неё непонятно, куда уходит
-            # время. В логе будет видно, что именно тормозит —
-            # проверки, отправка ордера или запись в БД.
+            # Разбивка по этапам.
+            #
+            # ms_wait — время от обнаружения сделки вотчером до начала
+            # проверок: очередь Redis, создание задачи, запрос
+            # пользователя из БД. Если тормозит здесь, оптимизировать
+            # надо не сеть, а путь доставки.
+            ms_wait = (time.monotonic() - copy_start_time) * 1000
             t_phase = time.monotonic()
 
             # Боевые проверки (в симуляции пропускаются, чтобы не
@@ -1284,6 +1291,14 @@ class TraderService:
                     )
                     return
 
+                # Короткий лок: только подсчёт номера входа и запись.
+                # Сетевые операции уже позади, здесь лишь два запроса
+                # к локальной БД — сериализация почти ничего не стоит.
+                async with self._position_lock(user_id, token_id):
+                    entry_number = await self._count_open_positions(
+                        session, user_id, token_id
+                    ) + 1
+
                 position = Position(
                     user_id=user_id,
                     market_id=trade_data.get("market_id", ""),
@@ -1341,12 +1356,19 @@ class TraderService:
                     f"📈 Цена входа: {entry_price:.4f}\n"
                     f"🎯 TP: {tp_text} | 🛑 SL: {sl_text}\n"
                     f"🕒 Время: {_now_str()}\n"
-                    f"⚡ Скорость: {speed_text}",
+                    f"⚡ Скорость: {speed_text}\n"
+                    # Разбивка прямо в уведомлении: логи до вас
+                    # регулярно не доходят, а по этим трём числам
+                    # сразу видно, где именно уходит время.
+                    f"⚙️ ожидание {ms_wait:.0f}мс · "
+                    f"проверки {ms_preflight:.0f}мс · "
+                    f"ордер {ms_order:.0f}мс",
                 )
 
                 self._record_timing(copy_elapsed_ms)
                 logger.info(
                     f"ТАЙМИНГ user={user_id}: "
+                    f"ожидание {ms_wait:.0f}мс, "
                     f"проверки {ms_preflight:.0f}мс, "
                     f"ордер {ms_order:.0f}мс, "
                     f"запись {(time.monotonic() - t_phase) * 1000:.0f}мс"
