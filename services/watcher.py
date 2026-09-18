@@ -353,9 +353,17 @@ class WalletWatcher:
                     f"({skip_reason})"
                 )
             elif not await self._claim_market_entry(user_id, t):
+                # Частая причина "перезаходы не работают": окно
+                # схлопывания ещё не истекло. Оно нужно, чтобы один
+                # ордер трейдера, разбитый на несколько транзакций, не
+                # копировался несколько раз — но если трейдер реально
+                # перезаходит быстрее этого окна, вход будет пропущен.
                 logger.info(
-                    f"user={user_id}: {t.tx_hash[:18]}... часть уже "
-                    f"скопированной ставки"
+                    f"user={user_id}: {t.tx_hash[:18]}... "
+                    f"({t.side} {t.token_id[:12]}...) пропущена — окно "
+                    f"схлопывания {settings.copy_dedup_window_seconds}с "
+                    f"ещё не истекло. Если это был настоящий перезаход, "
+                    f"уменьшите COPY_DEDUP_WINDOW_SECONDS."
                 )
             else:
                 await redis_client.publish(

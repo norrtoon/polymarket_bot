@@ -196,6 +196,8 @@ class TraderService:
         # Цена из стакана, полученная в проверках — передаём её в
         # ордер, чтобы SDK не запрашивал стакан ещё раз
         self._last_book_price: dict[str, tuple] = {}
+        # Предзапросы стакана, запущенные до основных проверок
+        self._book_inflight: dict[str, asyncio.Task] = {}
         # Фоновый прогрев капитала: задачи по user_id и период
         self._equity_tasks: dict[int, asyncio.Task] = {}
         self._equity_refresh_interval: float = 30.0
@@ -540,15 +542,15 @@ class TraderService:
         user_snapshot = _UserSnapshot(user)
 
         book, exposure_row, _ = await asyncio.gather(
-            polymarket_client.get_book_snapshot(token_id),
+            self._get_book(token_id),
             session.execute(exposure_stmt),
             # Прогрев кэша SDK: убирает сетевой запрос из момента
             # подписи ордера (см. warm_order_metadata).
             polymarket_client.warm_order_metadata(user_snapshot, token_id),
             return_exceptions=False,
         )
-        logger.debug(
-            f"preflight: параллельный блок за "
+        logger.info(
+            f"  этап: стакан+БД+прогрев = "
             f"{(time.monotonic() - t_book) * 1000:.0f}мс"
         )
 
@@ -592,6 +594,12 @@ class TraderService:
                         user_adv if user_adv is not None
                         else settings.max_slippage_percent
                     ))
+                    # 0 = проверка выключена. Стакан всё равно нужен:
+                    # из него берутся минимальный размер ордера и цена,
+                    # которая передаётся в ордер как limit_price (это
+                    # убирает лишний запрос стакана внутри SDK).
+                    if limit <= 0:
+                        adverse = False
                     if slip > limit:
                         return (
                             f"проскальзывание не в нашу пользу "
@@ -608,7 +616,9 @@ class TraderService:
                         user_fav if user_fav is not None
                         else settings.max_favorable_slippage_percent
                     ))
-                    if slip > limit:
+                    if limit <= 0:
+                        limit = None
+                    if limit is not None and slip > limit:
                         return (
                             f"цена изменилась слишком сильно "
                             f"({slip:.1f}% в нашу пользу, лимит {limit}%) "
@@ -704,6 +714,25 @@ class TraderService:
             )
         return None
 
+    def _prefetch_book(self, token_id: str) -> None:
+        """Начать тянуть стакан заранее, не дожидаясь результата."""
+        existing = self._book_inflight.get(token_id)
+        if existing is not None and not existing.done():
+            return
+        self._book_inflight[token_id] = asyncio.create_task(
+            polymarket_client.get_book_snapshot(token_id)
+        )
+
+    async def _get_book(self, token_id: str) -> dict:
+        """Забрать результат предзапроса или сделать запрос сейчас."""
+        task = self._book_inflight.pop(token_id, None)
+        if task is not None:
+            try:
+                return await task
+            except Exception:
+                pass
+        return await polymarket_client.get_book_snapshot(token_id)
+
     def _book_price_for(self, token_id: str) -> Decimal | None:
         """Цена из стакана, если она свежая (не старше 5 секунд)."""
         entry = self._last_book_price.get(token_id)
@@ -773,6 +802,14 @@ class TraderService:
                 f"execute_copy_trade: пустой token_id user={user_id}"
             )
             return
+
+        # Запускаем запрос стакана СРАЗУ, ещё до похода в БД за
+        # пользователем и до ожидания лока. Раньше он стартовал только
+        # внутри проверок — то есть после нескольких последовательных
+        # операций. Теперь сетевой запрос летит параллельно с ними, и к
+        # моменту проверок ответ уже готов.
+        if not settings.simulation_mode:
+            self._prefetch_book(token_id)
 
         # Лок на (пользователь, токен): execute_copy_trade запускается
         # через create_task, то есть сделки обрабатываются конкурентно.
@@ -863,10 +900,18 @@ class TraderService:
                     session, user_id, token_id
                 )
                 if not sell_shares or sell_shares <= 0:
-                    logger.info(
-                        f"user={user_id}: трейдер продал "
-                        f"{token_id[:16]}..., но у нас нет открытой "
-                        f"позиции по этому рынку — копировать нечего"
+                    logger.warning(
+                        f"user={user_id}: трейдер ПРОДАЛ "
+                        f"{token_id[:16]}..., но открытой позиции по "
+                        f"этому рынку у нас нет — копировать нечего. "
+                        f"Обычно значит, что вход не состоялся или "
+                        f"позицию уже закрыл TP/SL."
+                    )
+                    notify_user_bg(
+                        user_id,
+                        f"ℹ️ Трейдер вышел из рынка "
+                        f"{token_id[:10]}..., но у нас там нет открытой "
+                        f"позиции — закрывать нечего."
                     )
                     return
 
@@ -1045,7 +1090,7 @@ class TraderService:
                 )
 
                 logger.info(
-                    f"Тайминг user={user_id}: "
+                    f"ТАЙМИНГ user={user_id}: "
                     f"проверки {ms_preflight:.0f}мс, "
                     f"ордер {ms_order:.0f}мс, "
                     f"запись {(time.monotonic() - t_phase) * 1000:.0f}мс"
