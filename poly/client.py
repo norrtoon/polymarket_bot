@@ -51,6 +51,39 @@ FALLBACK_POLYGON_RPCS = [
 ]
 
 
+ATOMIC_SCALE = Decimal("1000000")   # 6 знаков, как у USDC
+
+
+def _normalize_amounts(making: Decimal, taking: Decimal) -> tuple:
+    """
+    Привести суммы из ответа биржи к обычным единицам.
+
+    Возвращает (making, taking) как есть, если они уже нормальные, или
+    делит обе на 1e6, если биржа отдала атомарные единицы.
+    """
+    if making <= 0 or taking <= 0:
+        return making, taking
+
+    # Цена = меньшая величина / большая. На Polymarket она всегда 0..1,
+    # поэтому долей всегда БОЛЬШЕ, чем потраченных USDC (кроме цены 1.0).
+    ratio = max(making, taking) / min(making, taking)
+
+    # Отношение больше 1000 невозможно: минимальная цена доли 0.001.
+    # Значит перед нами атомарные единицы... но только если ПОСЛЕ
+    # деления величины становятся правдоподобными.
+    if max(making, taking) >= ATOMIC_SCALE and ratio <= 1000:
+        scaled_making = making / ATOMIC_SCALE
+        scaled_taking = taking / ATOMIC_SCALE
+        logger.info(
+            f"Ответ биржи в атомарных единицах "
+            f"({making}/{taking}) -> "
+            f"{scaled_making}/{scaled_taking}"
+        )
+        return scaled_making, scaled_taking
+
+    return making, taking
+
+
 def _require_side(item: dict) -> str:
     """Сторона сделки строго из ответа API, без догадок."""
     raw = (item.get("side") or "").strip().upper()
@@ -1092,6 +1125,24 @@ class PolymarketClient:
             status = getattr(response, "status", None)
             making = Decimal(str(getattr(response, "making_amount", 0) or 0))
             taking = Decimal(str(getattr(response, "taking_amount", 0) or 0))
+
+            # Нормализация единиц.
+            #
+            # SDK не приводит making_amount/taking_amount к «человеческим»
+            # величинам — валидатор просто парсит строку. Исходный код
+            # проекта делил их на 1e6, то есть считал, что биржа отдаёт
+            # АТОМАРНЫЕ единицы (6 знаков). Проверить это заранее нельзя:
+            # ответ зависит от версии API.
+            #
+            # Поэтому проверяем на правдоподобие. Цена доли на Polymarket
+            # всегда в диапазоне 0..1, значит количество долей не может
+            # превышать потраченную сумму больше чем в 1000 раз (минимальная
+            # цена 0.001). Если превышает — единицы атомарные, делим.
+            #
+            # Без этой проверки количество долей завышалось в миллион раз:
+            # позиция показывала абсурдный плюс, а на продажу уходило
+            # неверное количество.
+            making, taking = _normalize_amounts(making, taking)
             tx_hashes = getattr(response, "transactions_hashes", ()) or ()
             order_id = getattr(response, "order_id", None)
 

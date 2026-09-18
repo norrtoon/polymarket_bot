@@ -84,6 +84,22 @@ def _build_result_message(
     pct = (pnl / invested * 100) if invested > 0 else Decimal("0")
     is_win = pnl > 0
 
+    # Защита от абсурдных значений.
+    #
+    # На рынках вероятностей большие проценты бывают законно: вход по
+    # 0.01 при выигрыше даёт почти +9900%, это правильная математика.
+    # Но такой же результат получается и при ОШИБКЕ в данных — именно
+    # так выглядел баг, когда проигравшая позиция объявлялась
+    # выигрышной. Логируем исходные числа, чтобы отличить одно от
+    # другого по логу, а не по ощущениям.
+    if abs(pct) > 500:
+        logger.warning(
+            f"Необычный результат по позиции {getattr(pos, 'id', '?')}: "
+            f"{pct:.0f}% (вложено {invested}, цена входа {entry}, "
+            f"долей {shares}, выплата {payout}, причина {reason}, "
+            f"won={won}). Проверьте позицию на polymarket.com."
+        )
+
     if reason == "resolved":
         head = "🏆 <b>СТАВКА СЫГРАЛА — ВЫИГРЫШ</b>" if won \
             else "💀 <b>СТАВКА СЫГРАЛА — ПРОИГРЫШ</b>"
@@ -201,6 +217,8 @@ class TraderService:
         # Фоновые задачи прогрева, запущенные при обнаружении сделки
         self._prewarm_tasks: set[asyncio.Task] = set()
         self._timings: list[float] = []
+        # Суммы, поднятые до минимума рынка в проверках
+        self._bumped_amount: dict[str, Decimal] = {}
         # Фоновый прогрев капитала: задачи по user_id и период
         self._equity_tasks: dict[int, asyncio.Task] = {}
         self._equity_refresh_interval: float = 30.0
@@ -561,6 +579,8 @@ class TraderService:
         # limit_price, чтобы SDK не запрашивал стакан ещё раз.
         self._last_book_price[token_id] = (
             book.get("best_ask") if side == "BUY" else book.get("best_bid"),
+            book.get("tick_size") or Decimal("0.01"),
+            side,
             time.monotonic(),
         )
 
@@ -601,12 +621,36 @@ class TraderService:
             if min_shares > 0:
                 our_shares = amount / expected_price
                 if our_shares < min_shares:
-                    need = min_shares * expected_price
+                    need = (min_shares * expected_price).quantize(
+                        Decimal("0.01"), rounding="ROUND_UP"
+                    )
+                    cap = Decimal(str(settings.max_bet_amount))
+
+                    # Минимум измеряется в ДОЛЯХ и фиксирован, а в
+                    # долларах зависит от цены: 5 долей по 0.10 — это
+                    # $0.50, по 0.90 — уже $4.50. Поэтому одна сумма
+                    # ставки физически не подходит ко всем рынкам, и
+                    # часть сделок отсекалась просто из-за цены.
+                    #
+                    # Слегка добавляем до минимума, если разрешено и
+                    # это не выходит за лимит ставки.
+                    if settings.auto_bump_to_min_order and need <= cap:
+                        logger.info(
+                            f"user={user.id}: ставка поднята "
+                            f"{amount:.2f} -> {need:.2f} USDC, чтобы "
+                            f"пройти минимум {min_shares} долей "
+                            f"при цене {expected_price:.4f}"
+                        )
+                        self._bumped_amount[token_id] = need
+                        return None
+
                     return (
                         f"ставка {amount:.2f} USDC даёт "
                         f"{our_shares:.2f} долей, а рынок требует "
                         f"минимум {min_shares} — нужно хотя бы "
                         f"{need:.2f} USDC при цене {expected_price:.4f}"
+                        + (f" (лимит ставки {cap} USDC)"
+                           if need > cap else "")
                     )
 
         # 3. Хватает ли свободных средств
@@ -636,6 +680,84 @@ class TraderService:
                 f"максимум {settings.max_total_exposure}"
             )
         return None
+
+    def _schedule_close_retry(
+        self, position_id: int, reason: str, attempt: int = 1
+    ) -> None:
+        """Повторить закрытие позиции через паузу, до 5 попыток."""
+        if attempt > 5:
+            logger.error(
+                f"Position {position_id}: закрыть не удалось за 5 попыток "
+                f"({reason}). Позиция остаётся открытой — закройте "
+                f"вручную на polymarket.com."
+            )
+            return
+
+        delay = min(15 * attempt, 60)
+
+        async def retry():
+            await asyncio.sleep(delay)
+            try:
+                async with async_session() as session:
+                    pos = await session.get(Position, position_id)
+                    if not pos or pos.status != "open":
+                        return  # уже закрылась
+                logger.info(
+                    f"Position {position_id}: повторная попытка "
+                    f"закрытия ({reason}), попытка {attempt + 1}"
+                )
+                await self.close_position(pos, reason=reason)
+            except Exception as e:
+                logger.error(
+                    f"Повтор закрытия {position_id}: "
+                    f"{type(e).__name__}: {e}"
+                )
+                self._schedule_close_retry(position_id, reason, attempt + 1)
+
+        task = asyncio.create_task(retry())
+        self._prewarm_tasks.add(task)
+        task.add_done_callback(self._prewarm_tasks.discard)
+
+    async def prewarm_at_startup(self) -> None:
+        """
+        Прогреть ВСЁ, что первая сделка иначе оплатит из своего времени.
+
+        В логах видно наглядно: первая сделка после запуска — проверки
+        1152мс, следующие — 53-69мс. Разница в двадцать раз, и вся она
+        приходится на разовые операции: TLS-рукопожатия, создание
+        клиента биржи, первый запрос геоблока.
+
+        Геоблок здесь особенно важен: стартовая проверка в main.py
+        кэшируется ОТДЕЛЬНО от кэша внутри трейдера, поэтому первая
+        же сделка всё равно делала собственный сетевой запрос.
+        """
+        # 1) Геоблок — заполняем именно трейдерский кэш
+        if not settings.simulation_mode:
+            try:
+                async with async_session() as session:
+                    first = (await session.execute(
+                        select(User).where(User.is_active.is_(True)).limit(1)
+                    )).scalar_one_or_none()
+                if first:
+                    await self._check_geoblock(first.id)
+                    logger.info("Кэш геоблока прогрет")
+            except Exception as e:
+                logger.debug(f"прогрев геоблока: {e}")
+
+        # 2) Соединение с БД: первый запрос иначе платит за коннект
+        try:
+            async with async_session() as session:
+                await session.execute(select(func.count()).select_from(Position))
+        except Exception as e:
+            logger.debug(f"прогрев БД: {e}")
+
+        # 3) Соединение со стаканом: TLS до clob.polymarket.com
+        try:
+            await polymarket_client.get_book_snapshot("warmup")
+        except Exception:
+            pass
+
+        logger.info("Прогрев завершён — первая сделка не будет холодной")
 
     def _record_timing(self, elapsed_ms: float) -> None:
         """
@@ -712,20 +834,46 @@ class TraderService:
 
     def _book_price_for(self, token_id: str) -> Decimal | None:
         """
-        Цена из стакана, если она достаточно свежая.
+        Предельная цена для ордера — с ШИРОКИМ запасом.
 
-        15 секунд, а не 5: прогрев теперь стартует ещё при обнаружении
-        сделки, и при слишком узком окне цена успевала "протухнуть" до
-        отправки ордера — тогда limit_price не передавался, и SDK шёл
-        запрашивать стакан сам, теряя оборот до Лондона.
+        Раньше сюда шла ровно текущая лучшая цена из стакана. Это жёсткий
+        лимит без допуска: стакан сдвигается на тик между нашим запросом
+        и приходом ордера — и биржа отвечает "No resting liquidity" /
+        "no orders found to match with FAK order". Именно это мешало
+        закрывать позиции по стоп-лоссу.
+
+        Лимит нужен не для контроля цены (защита от проскальзывания
+        отключена), а только чтобы SDK не ходил за стаканом второй раз.
+        Поэтому берём заведомо широкий диапазон: он не блокирует
+        исполнение, но позволяет SDK подписать ордер сразу.
         """
         entry = self._last_book_price.get(token_id)
         if not entry:
             return None
-        price, taken_at = entry
+        price, tick, side, taken_at = entry
         if price is None or time.monotonic() - taken_at > 15:
             return None
-        return price
+
+        tick = Decimal(str(tick or "0.01"))
+        price = Decimal(str(price))
+
+        if side == "BUY":
+            # Готовы заплатить сильно дороже текущего аска
+            limit = min(price * Decimal("2"), Decimal("0.99"))
+            limit = (limit / tick).to_integral_value(rounding="ROUND_FLOOR") * tick
+            floor_ = price
+            if limit < floor_:
+                limit = min(floor_, Decimal("0.99"))
+        else:
+            # Готовы продать сильно дешевле текущего бида
+            limit = max(price / Decimal("2"), tick)
+            limit = (limit / tick).to_integral_value(rounding="ROUND_CEILING") * tick
+            if limit > price:
+                limit = price
+
+        if limit <= 0 or limit >= 1:
+            return None
+        return limit
 
     async def _open_shares_for_token(
         self, session, user_id: int, token_id: str
@@ -877,6 +1025,11 @@ class TraderService:
                         user_id, f"⏭ Сделка пропущена: {reason}"
                     )
                     return
+
+            # Если проверки подняли сумму до минимума рынка — берём её
+            bumped = self._bumped_amount.pop(token_id, None)
+            if bumped is not None and bumped > amount:
+                amount = bumped
 
             ms_preflight = (time.monotonic() - t_phase) * 1000
             t_phase = time.monotonic()
@@ -1249,6 +1402,16 @@ class TraderService:
                     f"{result.error}. Позиция остаётся открытой, "
                     f"попробую снова."
                 )
+
+                # Раньше здесь всё и заканчивалось: мониторинг позиции
+                # уже снят (stop_watching_position вызывается сразу
+                # после close_position), поэтому "попробую снова" было
+                # неправдой — повторять было некому, и позиция висела
+                # открытой до разрешения рынка.
+                #
+                # Ставим отложенную повторную попытку: на неликвидном
+                # рынке заявки появляются, просто не сию секунду.
+                self._schedule_close_retry(pos.id, reason)
                 return
 
             pos.status = (
