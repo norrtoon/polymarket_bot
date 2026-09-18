@@ -1176,19 +1176,48 @@ class PolymarketClient:
                     filled_size=got_shares,
                 )
             elif status == "delayed":
+                # Отложенное исполнение. Если долей ещё нет — позицию
+                # открывать нельзя по той же причине, что и с "live".
+                if got_shares <= 0:
+                    logger.warning(
+                        f"Ордер {order_id} отложен биржей и пока не "
+                        f"исполнен — позицию не открываем"
+                    )
+                    return OrderResult(
+                        success=False, tx_hash=order_id,
+                        filled_price=None, filled_size=None,
+                        error="ордер отложен, исполнения пока нет",
+                    )
                 logger.warning(f"Order delayed: {order_id}")
                 return OrderResult(
                     success=True, tx_hash=order_id,
-                    filled_price=fill_price, filled_size=got_shares or None,
-                    error="delayed",
+                    filled_price=fill_price, filled_size=got_shares,
                 )
             elif status == "live":
-                # Лимитный остаток стоит в стакане, исполнения нет
+                # "live" = ордер ПРИНЯТ, но стоит в стакане и НЕ
+                # исполнен (полностью или частично).
+                #
+                # Раньше это возвращалось как success=True с нулевым
+                # количеством долей. В результате записывалась позиция,
+                # которой физически не существует: на кошельке ноль
+                # долей, а в базе открытая позиция. Потом стоп-лосс
+                # пытался её продать и получал от биржи
+                # "balance: 0, order amount: ...", а дальше бесконечно
+                # повторял попытки.
+                if got_shares <= 0:
+                    logger.warning(
+                        f"Ордер {order_id} принят, но НЕ исполнен "
+                        f"(стоит в стакане) — позицию не открываем"
+                    )
+                    return OrderResult(
+                        success=False, tx_hash=order_id,
+                        filled_price=None, filled_size=None,
+                        error="ордер не исполнен, стоит в стакане",
+                    )
                 return OrderResult(
                     success=True, tx_hash=order_id,
                     filled_price=fill_price,
                     filled_size=got_shares,
-                    error=None if got_shares > 0 else "live_unfilled",
                 )
             else:
                 logger.warning(

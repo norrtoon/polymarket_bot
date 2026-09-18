@@ -219,6 +219,8 @@ class TraderService:
         self._timings: list[float] = []
         # Суммы, поднятые до минимума рынка в проверках
         self._bumped_amount: dict[str, Decimal] = {}
+        # Позиции, о неудачном закрытии которых уже сообщили
+        self._close_retry_notified: set[int] = set()
         # Фоновый прогрев капитала: задачи по user_id и период
         self._equity_tasks: dict[int, asyncio.Task] = {}
         self._equity_refresh_interval: float = 30.0
@@ -702,6 +704,25 @@ class TraderService:
                 f"({reason}). Позиция остаётся открытой — закройте "
                 f"вручную на polymarket.com."
             )
+            self._close_retry_notified.discard(position_id)
+
+            async def _notify_giveup():
+                try:
+                    async with async_session() as session:
+                        pos = await session.get(Position, position_id)
+                        if pos and pos.status == "open":
+                            notify_user_bg(
+                                pos.user_id,
+                                f"❌ Позицию не удалось закрыть за 5 "
+                                f"попыток ({reason}). Закройте её "
+                                f"вручную на polymarket.com."
+                            )
+                except Exception:
+                    pass
+
+            task = asyncio.create_task(_notify_giveup())
+            self._prewarm_tasks.add(task)
+            task.add_done_callback(self._prewarm_tasks.discard)
             return
 
         delay = min(15 * attempt, 60)
@@ -919,6 +940,45 @@ class TraderService:
         total = Decimal("0")
         for pos in positions:
             shares = Decimal(str(pos.shares_bought or 0))
+
+            # Сверяем с биржей: если там долей нет, продавать нечего и
+            # повторять бессмысленно. Такое бывает, когда позиция в базе
+            # есть, а на кошельке её нет (ордер не исполнился, или
+            # позиция уже закрыта вручную).
+            if owner and owner.proxy_wallet and not settings.simulation_mode:
+                try:
+                    live = await polymarket_client.get_positions(
+                        owner.proxy_wallet
+                    )
+                    on_chain = Decimal("0")
+                    for lp in live:
+                        if lp.asset == pos.token_id:
+                            on_chain = Decimal(str(lp.size or 0))
+                            break
+                    if on_chain <= 0:
+                        logger.error(
+                            f"Position {pos.id}: на кошельке нет долей "
+                            f"по этому рынку — помечаем закрытой, "
+                            f"повторять нечего"
+                        )
+                        pos.status = "closed"
+                        pos.closed_at = datetime.utcnow()
+                        await session.commit()
+                        notify_user_bg(
+                            pos.user_id,
+                            "ℹ️ Позиция отмечена закрытой: долей по "
+                            "этому рынку на кошельке нет."
+                        )
+                        return
+                    if on_chain != shares:
+                        logger.info(
+                            f"Position {pos.id}: количество уточнено по "
+                            f"бирже {shares} -> {on_chain}"
+                        )
+                        shares = on_chain
+                except Exception as e:
+                    logger.warning(f"сверка позиции с биржей: {e}")
+
             if shares <= 0:
                 entry = Decimal(str(pos.entry_price or 0))
                 if entry > 0:
@@ -1204,6 +1264,26 @@ class TraderService:
                 tp_price, sl_price = self._calculate_tp_sl_prices(
                     entry_price, user
                 )
+                # Страховка от фантомных позиций.
+                #
+                # Позиция без реального количества долей потом не
+                # закрывается: биржа отвечает "balance: 0", стоп-лосс
+                # уходит в бесконечные повторы, а средства числятся
+                # вложенными. Лучше не открыть позицию вовсе, чем
+                # завести запись, которой не соответствуют доли.
+                filled = Decimal(str(result.filled_size or 0))
+                if filled <= 0:
+                    logger.error(
+                        f"user={user_id}: ордер вернул нулевое "
+                        f"количество долей — позиция НЕ создана "
+                        f"(tx={result.tx_hash})"
+                    )
+                    notify_user_bg(
+                        user_id,
+                        "⚠️ Ордер не дал исполнения — позиция не открыта."
+                    )
+                    return
+
                 position = Position(
                     user_id=user_id,
                     market_id=trade_data.get("market_id", ""),
@@ -1424,12 +1504,15 @@ class TraderService:
                     details={"error": result.error},
                 ))
                 await session.commit()
-                notify_user_bg(
-                    pos.user_id,
-                    f"⚠️ Не удалось закрыть позицию ({reason}): "
-                    f"{result.error}. Позиция остаётся открытой, "
-                    f"попробую снова."
-                )
+                # Уведомляем только о ПЕРВОЙ неудаче: повторов до пяти,
+                # и десять одинаковых сообщений подряд только мешают.
+                if pos.id not in self._close_retry_notified:
+                    self._close_retry_notified.add(pos.id)
+                    notify_user_bg(
+                        pos.user_id,
+                        f"⚠️ Не удалось закрыть позицию ({reason}): "
+                        f"{result.error}. Пробую повторно."
+                    )
 
                 # Раньше здесь всё и заканчивалось: мониторинг позиции
                 # уже снят (stop_watching_position вызывается сразу
