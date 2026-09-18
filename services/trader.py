@@ -198,6 +198,9 @@ class TraderService:
         self._last_book_price: dict[str, tuple] = {}
         # Предзапросы стакана, запущенные до основных проверок
         self._book_inflight: dict[str, asyncio.Task] = {}
+        # Фоновые задачи прогрева, запущенные при обнаружении сделки
+        self._prewarm_tasks: set[asyncio.Task] = set()
+        self._timings: list[float] = []
         # Фоновый прогрев капитала: задачи по user_id и период
         self._equity_tasks: dict[int, asyncio.Task] = {}
         self._equity_refresh_interval: float = 30.0
@@ -511,13 +514,13 @@ class TraderService:
         Возвращает текст причины отказа или None, если всё в порядке.
 
         Ни одной из этих проверок раньше не было: бот отправлял ордер
-        вслепую — без учёта баланса, проскальзывания и общей экспозиции.
+        вслепую — без учёта баланса и общей экспозиции.
         """
         if settings.simulation_mode:
             return None
 
         # ОДИН снимок стакана на все проверки ниже: и цена для
-        # проскальзывания, и минимальный размер ордера. Раньше это были
+        # ордера (limit_price), и минимальный размер. Раньше это были
         # два отдельных сетевых вызова в критическом пути.
         t_book = time.monotonic()
 
@@ -554,83 +557,12 @@ class TraderService:
             f"{(time.monotonic() - t_book) * 1000:.0f}мс"
         )
 
-        # 1. Проскальзывание. max_slippage_percent был объявлен в
-        #    конфиге и не использовался НИГДЕ. Копируемая сделка могла
-        #    сдвинуть цену, и FAK-ордер исполнился бы по любой доступной.
-        if expected_price and expected_price > 0:
-            # Для покупки ориентир — лучший АСК (мы платим его),
-            # для продажи — лучший БИД.
-            current = (
-                book.get("best_ask") if side == "BUY"
-                else book.get("best_bid")
-            )
-            if not current:
-                current = await polymarket_client.get_market_price(token_id)
-            if current and current > 0:
-                # Направление имеет значение, и раньше оно терялось:
-                # отклонение считалось по модулю, поэтому блокировались
-                # и ВЫГОДНЫЕ движения. Пример из практики: трейдер купил
-                # по 0.38, цена упала до 0.12 — за те же 3 USDC ты
-                # получил бы 25 долей вместо 7.89, то есть вход заметно
-                # лучше, а сделка отклонялась.
-                delta = (current - expected_price) / expected_price * 100
-
-                if side == "BUY":
-                    adverse = delta > 0   # платим дороже — плохо
-                else:
-                    adverse = delta < 0   # продаём дешевле — плохо
-
-                slip = abs(delta)
-
-                # Лимиты пользователя, если он их задал через бота,
-                # иначе — значения из .env
-                user_adv = getattr(user, "max_slippage_percent", None)
-                user_fav = getattr(
-                    user, "max_favorable_slippage_percent", None
-                )
-
-                if adverse:
-                    limit = Decimal(str(
-                        user_adv if user_adv is not None
-                        else settings.max_slippage_percent
-                    ))
-                    # 0 = проверка выключена. Стакан всё равно нужен:
-                    # из него берутся минимальный размер ордера и цена,
-                    # которая передаётся в ордер как limit_price (это
-                    # убирает лишний запрос стакана внутри SDK).
-                    if limit <= 0:
-                        adverse = False
-                    if slip > limit:
-                        return (
-                            f"проскальзывание не в нашу пользу "
-                            f"{slip:.1f}% выше лимита {limit}% "
-                            f"(ожидали {expected_price:.4f}, "
-                            f"сейчас {current:.4f})"
-                        )
-                else:
-                    # Выгодное движение пропускаем, но не безгранично:
-                    # скачок в разы означает, что рынок переоценил исход
-                    # (вышла новость) — это уже не та сделка, которую
-                    # совершил трейдер.
-                    limit = Decimal(str(
-                        user_fav if user_fav is not None
-                        else settings.max_favorable_slippage_percent
-                    ))
-                    if limit <= 0:
-                        limit = None
-                    if limit is not None and slip > limit:
-                        return (
-                            f"цена изменилась слишком сильно "
-                            f"({slip:.1f}% в нашу пользу, лимит {limit}%) "
-                            f"— рынок переоценил исход, это уже другая "
-                            f"сделка (ожидали {expected_price:.4f}, "
-                            f"сейчас {current:.4f})"
-                        )
-                    logger.info(
-                        f"user={user.id}: вход выгоднее трейдера на "
-                        f"{slip:.1f}% ({expected_price:.4f} -> "
-                        f"{current:.4f}), копируем"
-                    )
+        # Цену из стакана запоминаем: она передаётся в ордер как
+        # limit_price, чтобы SDK не запрашивал стакан ещё раз.
+        self._last_book_price[token_id] = (
+            book.get("best_ask") if side == "BUY" else book.get("best_bid"),
+            time.monotonic(),
+        )
 
         # ---- Дальше идут проверки, осмысленные ТОЛЬКО для покупки ----
         #
@@ -644,12 +576,7 @@ class TraderService:
         #   * минимум в долях считался как ставка/цена, хотя продаём мы
         #     shares_bought из позиции — другое число.
         #
-        # Для продажи остаётся только проверка проскальзывания выше:
-        # она направленная и для SELL корректна.
         if side != "BUY":
-            self._last_book_price[token_id] = (
-                book.get("best_bid"), time.monotonic()
-            )
             return None
 
         # 2a. Минимум площадки в долларах для рыночной покупки.
@@ -695,10 +622,6 @@ class TraderService:
                 )
 
         # 4. Ограничение общей экспозиции
-        self._last_book_price[token_id] = (
-            book.get("best_ask"), time.monotonic()
-        )
-
         row = exposure_row.one()
         open_count, open_sum = int(row[0] or 0), Decimal(str(row[1] or 0))
 
@@ -713,6 +636,60 @@ class TraderService:
                 f"максимум {settings.max_total_exposure}"
             )
         return None
+
+    def _record_timing(self, elapsed_ms: float) -> None:
+        """
+        Копим статистику скорости и раз в 10 сделок печатаем сводку.
+
+        Одна цифра в уведомлении не показывает разброс, а именно
+        разброс и мешает: важно видеть не только среднее, но и
+        худшие случаи.
+        """
+        self._timings.append(elapsed_ms)
+        if len(self._timings) < 10:
+            return
+        vals = sorted(self._timings)
+        n = len(vals)
+        logger.info(
+            f"СКОРОСТЬ за {n} сделок: "
+            f"мин {vals[0]:.0f}мс | "
+            f"медиана {vals[n // 2]:.0f}мс | "
+            f"худшая {vals[-1]:.0f}мс"
+        )
+        self._timings.clear()
+
+    def prewarm_for_trade(self, user_id: int, token_id: str) -> None:
+        """
+        Начать всю сетевую подготовку СРАЗУ при обнаружении сделки,
+        не дожидаясь, пока она дойдёт до исполнения.
+
+        Вызывается из вотчера перед публикацией. К моменту, когда
+        сделка пройдёт через Redis, подписку и БД, стакан и метаданные
+        рынка уже будут получены.
+        """
+        if settings.simulation_mode:
+            return
+
+        self._prefetch_book(token_id)
+
+        # Метаданные рынка нужны SDK для подписи ордера. Без прогрева
+        # он тянет их сам, синхронно, прямо перед отправкой.
+        async def _warm_meta():
+            try:
+                async with async_session() as session:
+                    user = await session.get(User, user_id)
+                    if not user or not user.private_key_enc:
+                        return
+                    snapshot = _UserSnapshot(user)
+                await polymarket_client.warm_order_metadata(
+                    snapshot, token_id
+                )
+            except Exception as e:
+                logger.debug(f"prewarm meta: {type(e).__name__}: {e}")
+
+        task = asyncio.create_task(_warm_meta())
+        self._prewarm_tasks.add(task)
+        task.add_done_callback(self._prewarm_tasks.discard)
 
     def _prefetch_book(self, token_id: str) -> None:
         """Начать тянуть стакан заранее, не дожидаясь результата."""
@@ -734,12 +711,19 @@ class TraderService:
         return await polymarket_client.get_book_snapshot(token_id)
 
     def _book_price_for(self, token_id: str) -> Decimal | None:
-        """Цена из стакана, если она свежая (не старше 5 секунд)."""
+        """
+        Цена из стакана, если она достаточно свежая.
+
+        15 секунд, а не 5: прогрев теперь стартует ещё при обнаружении
+        сделки, и при слишком узком окне цена успевала "протухнуть" до
+        отправки ордера — тогда limit_price не передавался, и SDK шёл
+        запрашивать стакан сам, теряя оборот до Лондона.
+        """
         entry = self._last_book_price.get(token_id)
         if not entry:
             return None
         price, taken_at = entry
-        if price is None or time.monotonic() - taken_at > 5:
+        if price is None or time.monotonic() - taken_at > 15:
             return None
         return price
 
@@ -1089,6 +1073,7 @@ class TraderService:
                     f"⚡ Скорость: {speed_text}",
                 )
 
+                self._record_timing(copy_elapsed_ms)
                 logger.info(
                     f"ТАЙМИНГ user={user_id}: "
                     f"проверки {ms_preflight:.0f}мс, "

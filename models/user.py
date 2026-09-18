@@ -48,21 +48,6 @@ class User(Base):
         String(16), default="SAFE"
     )
 
-    # --- Допустимое проскальзывание (в процентах) ---
-    # Свои значения на каждого пользователя. Если не заданы, берутся
-    # значения по умолчанию из .env.
-    #
-    # adverse — вход ХУЖЕ, чем у трейдера (покупаем дороже / продаём
-    #   дешевле). Прямая потеря: за ту же сумму получаем меньше долей.
-    # favorable — вход ЛУЧШЕ трейдера. Лимит мягче, но скачок в разы
-    #   означает, что рынок переоценил исход, и это уже другая сделка.
-    max_slippage_percent: Mapped[float | None] = mapped_column(
-        Float, nullable=True
-    )
-    max_favorable_slippage_percent: Mapped[float | None] = mapped_column(
-        Float, nullable=True
-    )
-
     # Пользователь завершил мастер настройки
     setup_completed: Mapped[bool] = mapped_column(Boolean, default=False)
     # Согласился с предупреждением о рисках хранения ключа

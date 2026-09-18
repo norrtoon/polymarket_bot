@@ -782,13 +782,13 @@ class PolymarketClient:
         ОДИН запрос к /book вместо двух: отдаёт и цены, и ограничения.
 
         Раньше в критическом пути боевого копирования шли ДВА отдельных
-        сетевых вызова — get_market_price (для проскальзывания) и
-        get_market_constraints (для минимального размера). Это лишний
-        round-trip на каждой сделке.
+        сетевых вызова — get_market_price и get_market_constraints.
+        Это был лишний round-trip на каждой сделке.
 
         Возвращает best_bid, best_ask, min_order_size, tick_size.
-        best_ask — цена, по которой мы реально КУПИМ (важно для
-        проскальзывания), best_bid — по которой продадим.
+        best_ask — цена, по которой мы реально КУПИМ, best_bid — по
+        которой продадим. Она же уходит в ордер как limit_price, чтобы
+        SDK не запрашивал стакан повторно.
         """
         try:
             session = await self.http()
