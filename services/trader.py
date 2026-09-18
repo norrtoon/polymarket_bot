@@ -293,8 +293,19 @@ class TraderService:
     async def _check_geoblock(self, user_id: int) -> bool:
         """Проверка геоблока с кэшированием на 5 минут"""
         now = time.monotonic()
+        # Успешную проверку держим 5 минут, а ЗАПРЕТ — всего 30 секунд.
+        #
+        # Раньше отрицательный результат кэшировался на те же 5 минут.
+        # Если проверка не прошла один раз (например, сеть ещё не
+        # прогрета сразу после запуска), торговля вставала на пять
+        # минут, а сделки при этом исчезали БЕЗ ЕДИНОЙ СТРОКИ в логе —
+        # выглядело как "бот перестал видеть ставки".
+        ttl = (
+            self._geoblock_cache_ttl if self._geoblock_ok
+            else 30.0
+        )
         if (self._geoblock_ok is not None and
-                now - self._geoblock_checked_at < self._geoblock_cache_ttl):
+                now - self._geoblock_checked_at < ttl):
             return self._geoblock_ok
 
         try:
@@ -740,7 +751,19 @@ class TraderService:
                     )).scalar_one_or_none()
                 if first:
                     await self._check_geoblock(first.id)
-                    logger.info("Кэш геоблока прогрет")
+                    if self._geoblock_ok:
+                        logger.info("Кэш геоблока прогрет: регион разрешён")
+                    else:
+                        # Прогрев идёт в самый холодный момент: сеть
+                        # ещё не установилась, DNS и TLS не прогреты.
+                        # Неудача здесь НЕ должна запирать торговлю —
+                        # сбрасываем кэш, чтобы первая реальная сделка
+                        # проверила заново.
+                        self._geoblock_ok = None
+                        logger.warning(
+                            "Прогрев геоблока не удался (сеть ещё не "
+                            "готова) — проверим при первой сделке"
+                        )
             except Exception as e:
                 logger.debug(f"прогрев геоблока: {e}")
 
@@ -924,6 +947,11 @@ class TraderService:
         # Геоблок с кэшированием (не тормозит каждый раз)
         if not settings.simulation_mode:
             if not await self._check_geoblock(user_id):
+                logger.error(
+                    f"user={user_id}: сделка {side} НЕ СКОПИРОВАНА — "
+                    f"проверка региона не пройдена. Это главная причина, "
+                    f"по которой бот может молча перестать копировать."
+                )
                 return
 
         side = trade_data.get("side", "BUY")
