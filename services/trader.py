@@ -816,7 +816,17 @@ class TraderService:
     ):
         async with async_session() as session:
             user = await session.get(User, user_id)
-            if not user or not user.is_active:
+            if not user:
+                logger.warning(
+                    f"user={user_id}: сделка {side} не скопирована — "
+                    f"пользователя нет в базе"
+                )
+                return
+            if not user.is_active:
+                logger.warning(
+                    f"user={user_id}: сделка {side} не скопирована — "
+                    f"копирование выключено (нажмите Старт)"
+                )
                 return
 
             # Перезаходы КОПИРУЮТСЯ (это осознанное поведение — бот

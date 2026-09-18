@@ -308,6 +308,14 @@ class WalletWatcher:
         # выросло, и эта подписка уже неактуальна.
         current_gen = await redis_client.get(f"watch_gen:{user_id}")
         if current_gen is None or int(current_gen) != sub.generation:
+            # Раньше здесь был ТИХИЙ выход: если поколение разъехалось,
+            # сделки молча выбрасывались, и в логе не было ни строки.
+            # Выглядело как "бот ничего не копирует" без объяснений.
+            logger.warning(
+                f"user={user_id}: сделки отброшены — поколение "
+                f"подписки {sub.generation}, текущее {current_gen}. "
+                f"Нажмите Стоп и Старт, чтобы пересоздать слежку."
+            )
             return
 
         if sub.baseline_pending:
@@ -328,6 +336,22 @@ class WalletWatcher:
         seen_set = set(seen_list)
 
         batch_newest = max(t.timestamp for t in trades)
+
+        # Что реально вернул API — до всякой фильтрации.
+        # Без этого невозможно отличить "бот отфильтровал продажу" от
+        # "трейдер её не совершал" или "API её не отдаёт".
+        sides = {}
+        for t in trades:
+            sides[t.side] = sides.get(t.side, 0) + 1
+        new_count = sum(
+            1 for t in trades if _trade_key(t) not in seen_set
+        )
+        if new_count:
+            logger.info(
+                f"user={user_id}: от API получено {len(trades)} сделок "
+                f"({', '.join(f'{k}: {v}' for k, v in sides.items())}), "
+                f"новых для нас: {new_count}"
+            )
 
         for t in reversed(trades):  # от старых к новым
             key = _trade_key(t)
@@ -414,23 +438,61 @@ class WalletWatcher:
 
     async def _claim_market_entry(self, user_id: int, t) -> bool:
         """
-        Занять право скопировать вход в рынок.
+        Отличить транзакции ОДНОГО ордера от настоящего перезахода.
 
-        Один ордер трейдера Polymarket проводит несколькими
-        транзакциями подряд. Первая занимает ключ на
-        copy_dedup_window_seconds, остальные видят занятый ключ и
-        копию не создают.
+        Раньше ключ ставился в Redis с TTL по НАСТЕННЫМ ЧАСАМ бота, то
+        есть окно отсчитывалось от момента ОБНАРУЖЕНИЯ сделки. А
+        обнаружение зависит от интервала опроса, задержек Data API и
+        бэкоффа при 429 — поэтому окно вело себя непредсказуемо:
+          * трейдер разбил ордер на две транзакции за 2 секунды, а бот
+            получил их с разницей в 20 — они НЕ схлопывались;
+          * трейдер реально перезашёл через 10 секунд — попадал в окно
+            и ПРОПАДАЛ.
+        Менять размер окна не помогало, потому что дело было не в
+        размере, а в точке отсчёта.
+
+        Теперь сравниваются метки времени САМИХ СДЕЛОК (шкала API).
+        Транзакции одного ордера всегда лежат в пределах пары секунд
+        друг от друга, а перезаход отличается заметно сильнее — и это
+        не зависит от того, когда бот успел их увидеть.
         """
         key = f"copied_entry:{user_id}:{t.token_id}:{t.side}"
+        window = max(1, int(settings.copy_dedup_window_seconds))
+
         try:
-            claimed = await redis_client.set(
-                key, t.tx_hash, nx=True,
-                ex=settings.copy_dedup_window_seconds,
-            )
-            return bool(claimed)
+            stored = await redis_client.get(key)
+
+            if stored is not None:
+                try:
+                    first_ts = int(float(stored))
+                except (TypeError, ValueError):
+                    first_ts = None
+
+                if first_ts is not None:
+                    gap = abs(int(t.timestamp) - first_ts)
+                    if gap <= window:
+                        logger.info(
+                            f"user={user_id}: {t.tx_hash[:18]}... — "
+                            f"часть того же ордера (разница со сделкой "
+                            f"в группе {gap}с, окно {window}с)"
+                        )
+                        return False
+                    logger.info(
+                        f"user={user_id}: {t.tx_hash[:18]}... — "
+                        f"ПЕРЕЗАХОД в {t.token_id[:12]}... "
+                        f"(прошло {gap}с с прошлого входа, окно {window}с)"
+                    )
+
+            # Новая группа: запоминаем метку времени этой сделки.
+            # TTL щедрый — он тут только чтобы ключи не копились вечно,
+            # на логику схлопывания он больше не влияет.
+            await redis_client.set(key, str(int(t.timestamp)), ex=3600)
+            return True
+
         except Exception as e:
             logger.warning(f"_claim_market_entry: {e}")
             return True
+
 
 
 wallet_watcher = WalletWatcher()
