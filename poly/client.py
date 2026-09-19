@@ -1270,7 +1270,75 @@ class PolymarketClient:
                 error=err_str
             )
 
-    async def redeem_positions(self, condition_id: str) -> OrderResult:
+    async def place_resting_sell(
+        self, token_id: str, shares: Decimal, price: Decimal, user
+    ) -> OrderResult:
+        """
+        Выставить лимитную продажу, которая ЖДЁТ покупателя.
+
+        Зачем: на тонком рынке рыночный ордер (FAK) исполняется только
+        тем, что прямо сейчас стоит в стакане. Если встречных заявок в
+        этот момент нет, биржа отвечает "no orders found to match" и
+        ордер просто уничтожается. Бот повторяет попытку позже — и
+        продаёт уже по худшей цене.
+
+        Лимитный ордер вместо этого ОСТАЁТСЯ в стакане и исполнится
+        сам, как только появится покупатель по нашей цене. Для выхода
+        из позиции это принципиально лучше: не нужно угадывать момент,
+        когда в стакане есть ликвидность.
+        """
+        if settings.simulation_mode:
+            return OrderResult(
+                success=True, tx_hash=f"SIM-LIMIT-{int(time.time())}",
+                filled_price=price, filled_size=shares,
+            )
+
+        await clob_order_limiter.acquire()
+        try:
+            client = await self.secure_for_user(user)
+            response = await client.place_limit_order(
+                token_id=token_id,
+                price=float(price),
+                size=float(shares),
+                side="SELL",
+            )
+
+            if getattr(response, "ok", None) is False:
+                return OrderResult(
+                    success=False, tx_hash=None, filled_price=None,
+                    filled_size=None,
+                    error=f"{getattr(response, 'code', '?')}: "
+                          f"{getattr(response, 'message', '')}",
+                )
+
+            status = getattr(response, "status", None)
+            order_id = getattr(response, "order_id", None)
+            making = Decimal(str(getattr(response, "making_amount", 0) or 0))
+            taking = Decimal(str(getattr(response, "taking_amount", 0) or 0))
+            making, taking = _normalize_amounts(making, taking)
+
+            logger.info(
+                f"Лимитная продажа выставлена: {shares} долей по "
+                f"{price}, статус={status}, id={order_id}"
+            )
+            return OrderResult(
+                success=True, tx_hash=order_id,
+                filled_price=price,
+                filled_size=making if making > 0 else shares,
+                error=None if status == "matched" else "resting",
+            )
+        except Exception as e:
+            logger.error(
+                f"place_resting_sell failed: {type(e).__name__}: {e}"
+            )
+            return OrderResult(
+                success=False, tx_hash=None, filled_price=None,
+                filled_size=None, error=str(e),
+            )
+
+    async def redeem_positions(
+        self, condition_id: str, user=None
+    ) -> OrderResult:
         if settings.simulation_mode:
             logger.info(f"[SIM] redeem condition_id={condition_id}")
             return OrderResult(
@@ -1280,7 +1348,17 @@ class PolymarketClient:
                 filled_size=None
             )
         try:
-            client = await self.secure()
+            # Клиент КОНКРЕТНОГО пользователя.
+            #
+            # Раньше здесь был self.secure() — глобальный клиент из
+            # .env. После перехода на ключи каждого пользователя
+            # глобальные креды пустые, поэтому погашение выигравших
+            # позиций падало всегда: деньги оставались в токенах,
+            # а не приходили на кошелёк.
+            if user is not None:
+                client = await self.secure_for_user(user)
+            else:
+                client = await self.secure()
             redeem = await client.redeem_positions(condition_id=condition_id)
             await redeem.wait()
             return OrderResult(

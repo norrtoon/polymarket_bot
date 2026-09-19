@@ -694,6 +694,25 @@ class TraderService:
             )
         return None
 
+    def _resting_sell_price(self, token_id: str) -> Decimal | None:
+        """
+        Цена для лимитной продажи: чуть ниже последнего известного
+        бида, чтобы встать первыми в очередь и исполниться сразу при
+        появлении покупателя.
+        """
+        entry = self._last_book_price.get(token_id)
+        if not entry:
+            return None
+        price, tick, _side, _ts = entry
+        if not price:
+            return None
+        tick = Decimal(str(tick or "0.01"))
+        price = Decimal(str(price))
+        limit = price - tick
+        if limit < tick:
+            limit = tick
+        return limit
+
     def _schedule_close_retry(
         self, position_id: int, reason: str, attempt: int = 1
     ) -> None:
@@ -725,7 +744,11 @@ class TraderService:
             task.add_done_callback(self._prewarm_tasks.discard)
             return
 
-        delay = min(15 * attempt, 60)
+        # Первые повторы — БЫСТРЫЕ: ликвидность на тонком рынке
+        # появляется и исчезает за секунды, а прежние 15с гарантировали
+        # продажу по уже уехавшей цене.
+        delays = [1, 3, 8, 20, 45]
+        delay = delays[min(attempt - 1, len(delays) - 1)]
 
         async def retry():
             await asyncio.sleep(delay)
@@ -802,6 +825,95 @@ class TraderService:
             pass
 
         logger.info("Прогрев завершён — первая сделка не будет холодной")
+
+    def _schedule_position_verification(self, position_id: int) -> None:
+        """
+        Через несколько секунд сверить позицию с биржей.
+
+        Уведомление "Скопирована сделка" отправляется по ответу биржи
+        на ордер. Но ответ может сообщать о принятии, а не об
+        исполнении — тогда в базе появляется позиция, которой на
+        кошельке нет. Пользователь видит подтверждение, а на
+        polymarket.com ордера нет: перезаход "только на словах".
+
+        Проверять синхронно нельзя — это добавило бы задержку в
+        критический путь, а данные на бирже появляются не мгновенно.
+        Поэтому сверяем отложенно и, если долей нет, честно помечаем
+        позицию несостоявшейся.
+        """
+        if settings.simulation_mode:
+            return
+
+        async def verify():
+            await asyncio.sleep(settings.position_verify_delay_seconds)
+            try:
+                async with async_session() as session:
+                    pos = await session.get(Position, position_id)
+                    if not pos or pos.status != "open":
+                        return
+                    owner = await session.get(User, pos.user_id)
+                    if not owner or not owner.proxy_wallet:
+                        return
+
+                    live = await polymarket_client.get_positions(
+                        owner.proxy_wallet
+                    )
+                    on_chain = Decimal("0")
+                    for lp in live:
+                        if lp.asset == pos.token_id:
+                            on_chain = Decimal(str(lp.size or 0))
+                            break
+
+                    if on_chain > 0:
+                        # Позиция реальна. Заодно уточняем количество:
+                        # фактическое исполнение может отличаться от
+                        # того, что вернул ответ на ордер.
+                        recorded = Decimal(str(pos.shares_bought or 0))
+                        if recorded > 0 and abs(on_chain - recorded) > \
+                                recorded * Decimal("0.02"):
+                            logger.info(
+                                f"Position {pos.id}: количество уточнено "
+                                f"по бирже {recorded} -> {on_chain}"
+                            )
+                            pos.shares_bought = on_chain
+                            await session.commit()
+                        return
+
+                    # Долей нет — ордер не исполнился
+                    logger.error(
+                        f"Position {pos.id}: НЕ ПОДТВЕРЖДЕНА биржей "
+                        f"(долей по {pos.token_id[:16]}... на кошельке "
+                        f"нет). Ордер не исполнился, помечаем как "
+                        f"несостоявшуюся."
+                    )
+                    pos.status = "failed"
+                    pos.closed_at = datetime.utcnow()
+                    await session.commit()
+
+                    notify_user_bg(
+                        pos.user_id,
+                        f"❌ <b>Сделка НЕ состоялась</b>\n"
+                        f"📊 Рынок: {pos.token_id[:10]}...\n"
+                        f"Ордер не исполнился на бирже — позиции нет. "
+                        f"Предыдущее подтверждение было преждевременным, "
+                        f"деньги не списаны."
+                    )
+
+                    try:
+                        from services.tp_sl_monitor import tp_sl_monitor
+                        await tp_sl_monitor.stop_watching_position(pos.id)
+                    except Exception:
+                        pass
+
+            except Exception as e:
+                logger.warning(
+                    f"сверка позиции {position_id}: "
+                    f"{type(e).__name__}: {e}"
+                )
+
+        task = asyncio.create_task(verify())
+        self._prewarm_tasks.add(task)
+        task.add_done_callback(self._prewarm_tasks.discard)
 
     def _record_timing(self, elapsed_ms: float) -> None:
         """
@@ -1373,6 +1485,11 @@ class TraderService:
                     f"ордер {ms_order:.0f}мс, "
                     f"запись {(time.monotonic() - t_phase) * 1000:.0f}мс"
                 )
+                # Отложенная сверка с биржей: ловит случаи, когда
+                # ордер приняли, но он не исполнился, и позиция
+                # оказалась только в нашей базе.
+                self._schedule_position_verification(position.id)
+
                 logger.info(
                     f"Position opened id={position.id} user={user_id} "
                     f"entry={entry_price} tp={tp_price} sl={sl_price} "
@@ -1536,14 +1653,45 @@ class TraderService:
                         f"{result.error}. Пробую повторно."
                     )
 
-                # Раньше здесь всё и заканчивалось: мониторинг позиции
-                # уже снят (stop_watching_position вызывается сразу
-                # после close_position), поэтому "попробую снова" было
-                # неправдой — повторять было некому, и позиция висела
-                # открытой до разрешения рынка.
+                # Нет встречных заявок — выставляем ЛИМИТНУЮ продажу.
                 #
-                # Ставим отложенную повторную попытку: на неликвидном
-                # рынке заявки появляются, просто не сию секунду.
+                # Рыночный ордер (FAK) исполняется только тем, что
+                # стоит в стакане прямо сейчас. На тонком рынке его
+                # просто уничтожает, и повтор через время продаёт уже
+                # по худшей цене — именно это и портило исход.
+                #
+                # Лимитный ордер остаётся в стакане и исполнится сам,
+                # как только появится покупатель. Цену берём чуть ниже
+                # текущего бида, чтобы встать первыми в очередь.
+                err = (result.error or "").lower()
+                no_liquidity = (
+                    "no orders found" in err
+                    or "no resting liquidity" in err
+                )
+                if no_liquidity and shares > 0:
+                    limit = self._resting_sell_price(pos.token_id)
+                    if limit:
+                        rest = await polymarket_client.place_resting_sell(
+                            token_id=pos.token_id, shares=shares,
+                            price=limit, user=owner,
+                        )
+                        if rest.success:
+                            logger.info(
+                                f"Position {pos.id}: выставлена лимитная "
+                                f"продажа {shares} долей по {limit} — "
+                                f"исполнится при появлении покупателя"
+                            )
+                            notify_user_bg(
+                                pos.user_id,
+                                f"📋 В стакане нет встречных заявок. "
+                                f"Выставил лимитную продажу по {limit:.4f} "
+                                f"— она исполнится, как только появится "
+                                f"покупатель."
+                            )
+                            self._schedule_close_retry(pos.id, reason)
+                            return
+
+                # Обычный повтор, если лимитную выставить не вышло
                 self._schedule_close_retry(pos.id, reason)
                 return
 
@@ -1585,10 +1733,25 @@ class TraderService:
             tx_hash = None
             if won:
                 try:
+                    owner = await session.get(User, pos.user_id)
                     result = await polymarket_client.redeem_positions(
-                        pos.market_id
+                        pos.market_id, user=owner
                     )
                     tx_hash = result.tx_hash if result.success else None
+                    if not result.success:
+                        logger.error(
+                            f"Position {pos.id}: погашение НЕ прошло "
+                            f"({result.error}). Выигрыш остался в "
+                            f"токенах — погасите вручную на "
+                            f"polymarket.com."
+                        )
+                        notify_user_bg(
+                            pos.user_id,
+                            f"⚠️ Выигрыш не удалось получить "
+                            f"автоматически: {result.error}. "
+                            f"Погасите позицию вручную на "
+                            f"polymarket.com."
+                        )
                 except Exception as e:
                     logger.error(f"redeem_positions error: {e}")
 
