@@ -202,6 +202,13 @@ async def main():
         ),
     ]
 
+    # Прогреваем всё, за что иначе заплатит первая сделка:
+    # геоблок, соединение с БД, TLS до биржи.
+    try:
+        await trader_service.prewarm_at_startup()
+    except Exception as e:
+        logger.warning(f"прогрев пропущен: {e}")
+
     # Держим соединение с биржей горячим: сделки приходят редко, а
     # простаивающее TCP-соединение рвётся молча, и первый же ордер
     # платит полный DNS+TCP+TLS до Лондона.
@@ -256,6 +263,21 @@ async def main():
             f"Установите coincurve — подпись ускорится на порядки. "
             f"Сейчас каждый ордер тратит на подпись десятки-сотни мс."
         )
+
+    # Печатаем ключевые настройки, которые РЕАЛЬНО применились.
+    # Иначе невозможно отличить "правка не работает" от "контейнер
+    # собран со старым кодом или .env перебивает значение".
+    logger.info(
+        "Настройки: "
+        f"ставка={settings.default_bet_amount} "
+        f"({settings.default_bet_mode}), "
+        f"авто-подъём={settings.auto_bump_to_min_order}, "
+        f"окно схлопывания={settings.copy_dedup_window_seconds}с, "
+        f"макс.позиций={settings.max_open_positions}, "
+        f"экспозиция={settings.max_total_exposure}, "
+        f"опрос={settings.poll_interval_seconds}с, "
+        f"симуляция={settings.simulation_mode}"
+    )
 
     logger.info(
         f"Bot started (uvloop: {'да' if _UVLOOP else 'НЕТ'}, "

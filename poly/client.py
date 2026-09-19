@@ -112,6 +112,8 @@ class PolymarketClient:
         self._working_rpc: str | None = None
         # SecureClient на каждого пользователя (свои ключи у каждого)
         self._user_clients: dict = {}
+        # Блокировки создания клиента, по одной на пользователя
+        self._client_locks: dict = {}
         self._keepalive_task: asyncio.Task | None = None
         self._warm_failed_logged = False
         # Счётчик полученных 429. Вотчер читает дельту и по ней
@@ -192,37 +194,58 @@ class PolymarketClient:
         if cached is not None:
             return cached
 
-        pk = crypto.decrypt(getattr(user, "private_key_enc", None))
-        if not pk:
-            raise RuntimeError(
-                f"у пользователя {user.id} нет приватного ключа — "
-                f"нужна настройка через /setup"
-            )
+        # Блокировка на пользователя.
+        #
+        # Раньше её не было: при пачке сделок все задачи одновременно
+        # видели пустой кэш и КАЖДАЯ начинала создавать своего клиента.
+        # А создание включает деривацию CLOB-кредов — подпись плюс
+        # сетевой запрос. В логах это выглядело как ~1900мс на этапе
+        # проверок сразу у трёх сделок подряд, хотя тёплый путь
+        # занимает 50-70мс.
+        #
+        # Теперь клиента создаёт только первая задача, остальные ждут
+        # её и берут готовый из кэша.
+        lock = self._client_locks.get(user.id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._client_locks[user.id] = lock
 
-        credentials = None
-        api_key = crypto.decrypt(getattr(user, "clob_api_key_enc", None))
-        api_secret = crypto.decrypt(getattr(user, "clob_api_secret_enc", None))
-        api_pass = crypto.decrypt(
-            getattr(user, "clob_api_passphrase_enc", None)
-        )
-        if SDK_AVAILABLE and api_key and api_secret:
-            try:
-                credentials = ApiKeyCreds(
-                    key=api_key, secret=api_secret, passphrase=api_pass or "",
+        async with lock:
+            cached = self._user_clients.get(user.id)
+            if cached is not None:
+                return cached
+
+            pk = crypto.decrypt(getattr(user, "private_key_enc", None))
+            if not pk:
+                raise RuntimeError(
+                    f"у пользователя {user.id} нет приватного ключа — "
+                    f"нужна настройка через /setup"
                 )
-            except TypeError:
-                try:
-                    credentials = ApiKeyCreds(key=api_key, secret=api_secret)
-                except TypeError:
-                    credentials = None
 
-        client = await AsyncSecureClient.create(
-            private_key=pk, credentials=credentials,
-        )
-        await client.__aenter__()
-        self._user_clients[user.id] = client
-        logger.info(f"SecureClient создан для пользователя {user.id}")
-        return client
+            credentials = None
+            api_key = crypto.decrypt(getattr(user, "clob_api_key_enc", None))
+            api_secret = crypto.decrypt(getattr(user, "clob_api_secret_enc", None))
+            api_pass = crypto.decrypt(
+                getattr(user, "clob_api_passphrase_enc", None)
+            )
+            if SDK_AVAILABLE and api_key and api_secret:
+                try:
+                    credentials = ApiKeyCreds(
+                        key=api_key, secret=api_secret, passphrase=api_pass or "",
+                    )
+                except TypeError:
+                    try:
+                        credentials = ApiKeyCreds(key=api_key, secret=api_secret)
+                    except TypeError:
+                        credentials = None
+
+            client = await AsyncSecureClient.create(
+                private_key=pk, credentials=credentials,
+            )
+            await client.__aenter__()
+            self._user_clients[user.id] = client
+            logger.info(f"SecureClient создан для пользователя {user.id}")
+            return client
 
     async def ensure_trading_approvals(self, user) -> tuple[bool, str]:
         """
