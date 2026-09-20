@@ -617,10 +617,13 @@ class TraderService:
         # 2a. Минимум площадки в долларах для рыночной покупки.
         # Биржа отклоняет marketable BUY меньше 1 USDC. Проверяем сами,
         # чтобы пользователь видел понятную причину, а не отказ биржи.
-        if amount < settings.min_order_usdc:
+        if amount < Decimal(str(
+            getattr(settings, "min_order_usdc", "1.0")
+        )):
             return (
                 f"ставка {amount:.2f} USDC меньше минимума площадки "
-                f"({settings.min_order_usdc} USDC для рыночной покупки)"
+                f"({getattr(settings, 'min_order_usdc', 1)} USDC "
+                f"для рыночной покупки)"
             )
 
         # 2b. Минимальный размер ордера в долях.
@@ -649,7 +652,10 @@ class TraderService:
                     #
                     # Слегка добавляем до минимума, если разрешено и
                     # это не выходит за лимит ставки.
-                    if settings.auto_bump_to_min_order and need <= cap:
+                    auto_bump = getattr(
+                        settings, "auto_bump_to_min_order", True
+                    )
+                    if auto_bump and need <= cap:
                         logger.info(
                             f"user={user.id}: ставка поднята "
                             f"{amount:.2f} -> {need:.2f} USDC, чтобы "
@@ -899,7 +905,13 @@ class TraderService:
             return
 
         async def verify():
-            await asyncio.sleep(settings.position_verify_delay_seconds)
+            # getattr с запасным значением: если core/config.py
+            # окажется старее services/trader.py (например, при
+            # частичном обновлении репозитория), задача не должна
+            # падать с AttributeError и молча терять сверку позиции.
+            await asyncio.sleep(
+                getattr(settings, "position_verify_delay_seconds", 12)
+            )
             try:
                 async with async_session() as session:
                     pos = await session.get(Position, position_id)
@@ -1599,9 +1611,10 @@ class TraderService:
                             # токен останется, если по нему есть другие
                             # позиции — другого пользователя или
                             # перезаходы этого же.
-                            await tp_sl_monitor.stop_watching_position(
-                                pos.id
-                            )
+                            for p_ in siblings:
+                                await tp_sl_monitor.stop_watching_position(
+                                    p_.id
+                                )
                         except Exception as e:
                             logger.warning(
                                 f"unsubscribe on SELL close error: {e}"
@@ -1627,6 +1640,23 @@ class TraderService:
         trigger_price: Decimal | None = None,
         attempt: int = 1,
     ):
+        # Лок на (пользователь, рынок): обработчики TP/SL у разных
+        # позиций одного рынка срабатывают почти одновременно. Без
+        # лока они успевали войти в закрытие параллельно, ещё до того
+        # как первый пометит позиции закрытыми — и групповое закрытие
+        # не спасало бы от конкуренции за стакан.
+        async with self._position_lock(position.user_id, position.token_id):
+            await self._close_position_locked(
+                position, reason, trigger_elapsed_ms,
+                trigger_price, attempt,
+            )
+
+    async def _close_position_locked(
+        self, position: Position, reason: str,
+        trigger_elapsed_ms: float | None = None,
+        trigger_price: Decimal | None = None,
+        attempt: int = 1,
+    ):
         async with async_session() as session:
             pos = await session.get(Position, position.id)
             if not pos or pos.status != "open":
@@ -1642,7 +1672,50 @@ class TraderService:
             # количества долей", а деньги оставались в рынке. Считаем
             # доли из вложенной суммы и цены входа, а если есть связь
             # с биржей — уточняем по фактической позиции.
-            shares = Decimal(str(pos.shares_bought or 0))
+            # Закрываем ВСЕ позиции по этому рынку, у которых сработал
+            # тот же уровень, ОДНИМ ордером.
+            #
+            # Раньше каждая позиция закрывалась отдельно. При
+            # перезаходах их по рынку несколько, обработчики TP/SL
+            # срабатывают почти одновременно — и бот слал несколько
+            # ордеров на продажу в ОДИН стакан. Первые выедали
+            # доступные заявки, последнему не доставалось ничего:
+            # "no orders found to match". Бот конкурировал сам с собой.
+            siblings = [pos]
+            if trigger_price is not None:
+                try:
+                    stmt = select(Position).where(
+                        Position.user_id == pos.user_id,
+                        Position.token_id == pos.token_id,
+                        Position.status == "open",
+                        Position.id != pos.id,
+                    )
+                    others = (await session.execute(stmt)).scalars().all()
+                    px = Decimal(str(trigger_price))
+                    for other in others:
+                        # Берём только те, у которых уровень пробит
+                        # этой же ценой — иначе закроем позицию,
+                        # которая ещё не должна закрываться.
+                        if reason == "tp" and other.tp_price and \
+                                px >= Decimal(str(other.tp_price)):
+                            siblings.append(other)
+                        elif reason == "sl" and other.sl_price and \
+                                px <= Decimal(str(other.sl_price)):
+                            siblings.append(other)
+                except Exception as e:
+                    logger.warning(f"поиск позиций того же рынка: {e}")
+
+            if len(siblings) > 1:
+                logger.info(
+                    f"Position {pos.id}: по рынку {pos.token_id[:12]}... "
+                    f"сработал {reason} сразу у {len(siblings)} позиций "
+                    f"— закрываем одним ордером"
+                )
+
+            shares = sum(
+                (Decimal(str(p_.shares_bought or 0)) for p_ in siblings),
+                Decimal("0"),
+            )
             if shares <= 0:
                 entry = Decimal(str(pos.entry_price or 0))
                 if entry > 0:
@@ -1842,11 +1915,15 @@ class TraderService:
                 self._schedule_close_retry(pos.id, reason, attempt + 1)
                 return
 
-            pos.status = (
+            new_status = (
                 f"{reason}_hit" if reason in ("tp", "sl") else "closed"
             )
-            pos.closed_at = datetime.utcnow()
-            pos.tx_hash_ours = result.tx_hash or pos.tx_hash_ours
+            for p_ in siblings:
+                p_.status = new_status
+                p_.closed_at = datetime.utcnow()
+                p_.tx_hash_ours = result.tx_hash or p_.tx_hash_ours
+                if result.filled_price:
+                    p_.current_price = result.filled_price
 
             session.add(TradeLog(
                 user_id=pos.user_id,
@@ -1861,6 +1938,14 @@ class TraderService:
 
             # Цена выхода: фактический филл, иначе последняя известная
             exit_price = result.filled_price or pos.current_price
+            if len(siblings) > 1:
+                notify_user_bg(
+                    pos.user_id,
+                    f"ℹ️ По рынку {pos.token_id[:10]}... закрыто "
+                    f"{len(siblings)} позиций одним ордером "
+                    f"({shares} долей) — иначе они конкурировали бы "
+                    f"за один стакан."
+                )
             notify_user_bg(
                 pos.user_id,
                 _build_result_message(
