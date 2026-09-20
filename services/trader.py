@@ -221,6 +221,8 @@ class TraderService:
         self._bumped_amount: dict[str, Decimal] = {}
         # Позиции, о неудачном закрытии которых уже сообщили
         self._close_retry_notified: set[int] = set()
+        # Активные задачи повторного закрытия, по одной на позицию
+        self._close_retry_tasks: dict[int, asyncio.Task] = {}
         # Фоновый прогрев капитала: задачи по user_id и период
         self._equity_tasks: dict[int, asyncio.Task] = {}
         self._equity_refresh_interval: float = 30.0
@@ -694,6 +696,47 @@ class TraderService:
             )
         return None
 
+    async def _settle_resolved_position(self, position_id: int) -> None:
+        """
+        Закрыть позицию на разрешившемся рынке.
+
+        Смотрим, есть ли доли на кошельке и подлежат ли они погашению.
+        Если да — гасим (выигрыш придёт на кошелёк). Если долей нет
+        или они ничего не стоят — помечаем позицию проигранной.
+        """
+        try:
+            async with async_session() as session:
+                pos = await session.get(Position, position_id)
+                if not pos or pos.status != "open":
+                    return
+                owner = await session.get(User, pos.user_id)
+                if not owner or not owner.proxy_wallet:
+                    return
+
+                won = False
+                try:
+                    redeemable = await polymarket_client.get_positions(
+                        owner.proxy_wallet, redeemable=True
+                    )
+                    won = any(
+                        p.asset == pos.token_id and (p.size or 0) > 0
+                        for p in redeemable
+                    )
+                except Exception as e:
+                    logger.warning(f"проверка погашаемости: {e}")
+
+            # redeem_resolved_position сам запишет статус и уведомит
+            async with async_session() as session:
+                pos = await session.get(Position, position_id)
+                if pos and pos.status == "open":
+                    await self.redeem_resolved_position(pos, won=won)
+
+        except Exception as e:
+            logger.error(
+                f"_settle_resolved_position {position_id}: "
+                f"{type(e).__name__}: {e}"
+            )
+
     def _resting_sell_price(self, token_id: str) -> Decimal | None:
         """
         Цена для лимитной продажи: чуть ниже последнего известного
@@ -744,6 +787,15 @@ class TraderService:
             task.add_done_callback(self._prewarm_tasks.discard)
             return
 
+        # Не плодим параллельные попытки по одной позиции.
+        #
+        # Из-за сброса счётчика запускалось по новой задаче на каждую
+        # неудачу, и они накладывались друг на друга — в логе это
+        # выглядело как непрерывный поток попыток раз в секунду.
+        existing = self._close_retry_tasks.get(position_id)
+        if existing is not None and not existing.done():
+            return
+
         # Первые повторы — БЫСТРЫЕ: ликвидность на тонком рынке
         # появляется и исчезает за секунды, а прежние 15с гарантировали
         # продажу по уже уехавшей цене.
@@ -761,7 +813,9 @@ class TraderService:
                     f"Position {position_id}: повторная попытка "
                     f"закрытия ({reason}), попытка {attempt + 1}"
                 )
-                await self.close_position(pos, reason=reason)
+                await self.close_position(
+                    pos, reason=reason, attempt=attempt
+                )
             except Exception as e:
                 logger.error(
                     f"Повтор закрытия {position_id}: "
@@ -1571,6 +1625,7 @@ class TraderService:
         self, position: Position, reason: str,
         trigger_elapsed_ms: float | None = None,
         trigger_price: Decimal | None = None,
+        attempt: int = 1,
     ):
         async with async_session() as session:
             pos = await session.get(Position, position.id)
@@ -1616,6 +1671,68 @@ class TraderService:
                 if shares > 0:
                     pos.shares_bought = shares
                     await session.commit()
+
+            # ПЕРЕД ПОВТОРНОЙ попыткой сверяемся с биржей.
+            #
+            # Раньше эта сверка была вложена в ветку "количество долей
+            # потерялось" и при нормально записанном количестве не
+            # выполнялась вовсе. Из-за этого бот продолжал слать
+            # продажи по позиции, которой на бирже уже нет: лимитный
+            # ордер мог исполниться сам, или позиция была закрыта
+            # вручную, а в базе она оставалась открытой.
+            #
+            # На ПЕРВОЙ попытке проверку пропускаем: там важна скорость
+            # (сработал TP/SL), а позиция почти наверняка ещё на месте.
+            if attempt > 1 and owner and owner.proxy_wallet \
+                    and not settings.simulation_mode:
+                try:
+                    live = await polymarket_client.get_positions(
+                        owner.proxy_wallet
+                    )
+                    on_chain = Decimal("0")
+                    for lp in live:
+                        if lp.asset == pos.token_id:
+                            on_chain = Decimal(str(lp.size or 0))
+                            break
+
+                    if on_chain <= 0:
+                        logger.info(
+                            f"Position {pos.id}: на бирже позиции уже "
+                            f"нет — закрылась сама. Помечаем закрытой, "
+                            f"повторы прекращаем."
+                        )
+                        pos.status = (
+                            f"{reason}_hit" if reason in ("tp", "sl")
+                            else "closed"
+                        )
+                        pos.closed_at = datetime.utcnow()
+                        await session.commit()
+                        self._close_retry_notified.discard(pos.id)
+                        notify_user_bg(
+                            pos.user_id,
+                            "✅ Позиция закрылась на бирже — "
+                            "лимитный ордер исполнился. Повторы "
+                            "остановлены."
+                        )
+                        try:
+                            from services.tp_sl_monitor import (
+                                tp_sl_monitor,
+                            )
+                            await tp_sl_monitor.stop_watching_position(
+                                pos.id
+                            )
+                        except Exception:
+                            pass
+                        return
+
+                    if on_chain != shares:
+                        logger.info(
+                            f"Position {pos.id}: количество уточнено "
+                            f"по бирже {shares} -> {on_chain}"
+                        )
+                        shares = on_chain
+                except Exception as e:
+                    logger.warning(f"сверка перед повтором: {e}")
 
             result = await polymarket_client.place_market_order(
                 token_id=pos.token_id,
@@ -1664,6 +1781,23 @@ class TraderService:
                 # как только появится покупатель. Цену берём чуть ниже
                 # текущего бида, чтобы встать первыми в очередь.
                 err = (result.error or "").lower()
+
+                # Стакана больше нет = рынок РАЗРЕШИЛСЯ.
+                #
+                # Продать там невозможно в принципе: торговля
+                # закончена, позиция теперь либо гасится (если
+                # выиграла), либо обнуляется. Раньше бот этого не
+                # различал и бесконечно пытался продать — в логе шли
+                # десятки "No orderbook exists" подряд.
+                if "no orderbook exists" in err or "market is closed" in err:
+                    logger.info(
+                        f"Position {pos.id}: рынок разрешился, продажа "
+                        f"невозможна — переходим к погашению"
+                    )
+                    await session.commit()
+                    await self._settle_resolved_position(pos.id)
+                    return
+
                 no_liquidity = (
                     "no orders found" in err
                     or "no resting liquidity" in err
@@ -1681,6 +1815,13 @@ class TraderService:
                                 f"продажа {shares} долей по {limit} — "
                                 f"исполнится при появлении покупателя"
                             )
+                            # Запоминаем, что по позиции уже стоит
+                            # заявка в стакане. Повтор рыночной продажи
+                            # при живой лимитной приводил к тому, что
+                            # бот слал ордера по позиции, которая вот-вот
+                            # закроется сама.
+                            pos.tx_hash_ours = rest.tx_hash or pos.tx_hash_ours
+                            await session.commit()
                             notify_user_bg(
                                 pos.user_id,
                                 f"📋 В стакане нет встречных заявок. "
@@ -1688,11 +1829,17 @@ class TraderService:
                                 f"— она исполнится, как только появится "
                                 f"покупатель."
                             )
-                            self._schedule_close_retry(pos.id, reason)
+                            self._schedule_close_retry(
+                                pos.id, reason, attempt + 1
+                            )
                             return
 
-                # Обычный повтор, если лимитную выставить не вышло
-                self._schedule_close_retry(pos.id, reason)
+                # Обычный повтор, если лимитную выставить не вышло.
+                # ВАЖНО: передаём attempt + 1. Раньше здесь вызывался
+                # планировщик с умолчанием attempt=1, поэтому счётчик
+                # никогда не рос: в логе вечно повторялось "попытка 2",
+                # и бот долбил продажу бесконечно.
+                self._schedule_close_retry(pos.id, reason, attempt + 1)
                 return
 
             pos.status = (
