@@ -1119,44 +1119,6 @@ class TraderService:
         for pos in positions:
             shares = Decimal(str(pos.shares_bought or 0))
 
-            # Сверяем с биржей: если там долей нет, продавать нечего и
-            # повторять бессмысленно. Такое бывает, когда позиция в базе
-            # есть, а на кошельке её нет (ордер не исполнился, или
-            # позиция уже закрыта вручную).
-            if owner and owner.proxy_wallet and not settings.simulation_mode:
-                try:
-                    live = await polymarket_client.get_positions(
-                        owner.proxy_wallet
-                    )
-                    on_chain = Decimal("0")
-                    for lp in live:
-                        if lp.asset == pos.token_id:
-                            on_chain = Decimal(str(lp.size or 0))
-                            break
-                    if on_chain <= 0:
-                        logger.error(
-                            f"Position {pos.id}: на кошельке нет долей "
-                            f"по этому рынку — помечаем закрытой, "
-                            f"повторять нечего"
-                        )
-                        pos.status = "closed"
-                        pos.closed_at = datetime.utcnow()
-                        await session.commit()
-                        notify_user_bg(
-                            pos.user_id,
-                            "ℹ️ Позиция отмечена закрытой: долей по "
-                            "этому рынку на кошельке нет."
-                        )
-                        return
-                    if on_chain != shares:
-                        logger.info(
-                            f"Position {pos.id}: количество уточнено по "
-                            f"бирже {shares} -> {on_chain}"
-                        )
-                        shares = on_chain
-                except Exception as e:
-                    logger.warning(f"сверка позиции с биржей: {e}")
-
             if shares <= 0:
                 entry = Decimal(str(pos.entry_price or 0))
                 if entry > 0:
@@ -1611,10 +1573,9 @@ class TraderService:
                             # токен останется, если по нему есть другие
                             # позиции — другого пользователя или
                             # перезаходы этого же.
-                            for p_ in siblings:
-                                await tp_sl_monitor.stop_watching_position(
-                                    p_.id
-                                )
+                            await tp_sl_monitor.stop_watching_position(
+                                pos.id
+                            )
                         except Exception as e:
                             logger.warning(
                                 f"unsubscribe on SELL close error: {e}"
