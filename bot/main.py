@@ -284,6 +284,30 @@ async def main():
         f"подпись: {_ecc})"
     )
 
+    # Снимаем Telegram-вебхук перед запуском опроса.
+    #
+    # Если на токене бота зарегистрирован вебхук, метод getUpdates
+    # работать не может: Telegram отвечает
+    # "Conflict: can't use getUpdates method while webhook is active".
+    # Бот при этом НЕ ВИДИТ нажатий кнопок и команд — выглядит как
+    # полностью зависший интерфейс, хотя копирование сделок при этом
+    # продолжает работать (оно идёт от опроса Polymarket, а не от
+    # Telegram).
+    #
+    # Вебхук мог остаться от прошлых экспериментов или от стороннего
+    # сервиса. Снимаем его при каждом старте — это безопасно и
+    # ничего не ломает, если вебхука нет.
+    try:
+        info = await bot.get_webhook_info()
+        if info.url:
+            logger.warning(
+                f"На токене был активен Telegram-вебхук ({info.url}) — "
+                f"снимаю, иначе бот не получает обновления"
+            )
+        await bot.delete_webhook(drop_pending_updates=True)
+    except Exception as e:
+        logger.warning(f"не удалось снять вебхук: {type(e).__name__}: {e}")
+
     try:
         await dp.start_polling(
             bot,
