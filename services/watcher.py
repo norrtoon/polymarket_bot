@@ -2,7 +2,7 @@
 Слежка за кошельками трейдеров.
 
 АРХИТЕКТУРА: один цикл опроса на КОШЕЛЁК, а не на пользователя.
-for test
+
 Раньше каждый пользователь запускал собственный цикл опроса Data API.
 Нагрузка росла линейно с числом клиентов, а лимит Cloudflare считается
 ПО IP на весь сервер — при двух пользователях 429 шли уже потоком, при
@@ -178,7 +178,39 @@ class WalletWatcher:
                 sub.baseline_ts = 0.0
                 return True
 
-            sub.baseline_ts = max(t.timestamp for t in trades)
+            existing_raw = await redis_client.get(cache_key)
+            is_first_ever = not existing_raw
+
+            if is_first_ever:
+                # ПЕРВЫЙ запуск слежки за этим кошельком: ставим рубеж,
+                # чтобы не скопировать всю историю трейдера.
+                sub.baseline_ts = max(t.timestamp for t in trades)
+                logger.info(
+                    f"baseline user={sub.user_id}: первый запуск, рубеж "
+                    f"{_fmt_ts(sub.baseline_ts)} — историю не копируем"
+                )
+            else:
+                # ПЕРЕЗАПУСК: рубеж НЕ сдвигаем.
+                #
+                # Раньше он выставлялся на самую свежую сделку при
+                # каждом старте, а последние 10 сделок помечались
+                # виденными. Всё, что трейдер сделал за время
+                # перезапуска контейнера, терялось безвозвратно —
+                # а при частых деплоях это происходило регулярно.
+                # Именно так пропадали сделки: бот "не видел" вход,
+                # сделанный пока он перезапускался.
+                #
+                # Сбрасывать рубеж незачем: кэш уже скопированных
+                # сделок хранится в Redis и переживает рестарт, а от
+                # копирования древней истории защищает фильтр по
+                # возрасту (max_trade_age_seconds).
+                sub.baseline_ts = 0.0
+                logger.info(
+                    f"baseline user={sub.user_id}: перезапуск — рубеж "
+                    f"не сдвигаем, сделки за время простоя будут "
+                    f"скопированы, если не старше "
+                    f"{settings.max_trade_age_seconds}с"
+                )
 
             # Кэш дедупликации НЕ стираем, а дополняем.
             #
@@ -187,15 +219,19 @@ class WalletWatcher:
             # что Data API отдаёт данные с задержкой и новая точка
             # отсчёта оказывалась в прошлом. Позиции открывались по
             # устаревшим ценам и мгновенно закрывались по TP/SL.
-            existing = await redis_client.get(cache_key)
-            seen = json.loads(existing) if existing else []
-            for t in trades:
-                k = _trade_key(t)
-                if k not in seen:
-                    seen.append(k)
-            await redis_client.set(
-                cache_key, json.dumps(seen[-SEEN_WINDOW:])
-            )
+            seen = json.loads(existing_raw) if existing_raw else []
+            if is_first_ever:
+                # Только при первом запуске помечаем текущие сделки
+                # виденными. При перезапуске этого делать НЕЛЬЗЯ:
+                # иначе сделки, сделанные во время простоя, будут
+                # записаны как уже обработанные и потеряны.
+                for t in trades:
+                    k = _trade_key(t)
+                    if k not in seen:
+                        seen.append(k)
+                await redis_client.set(
+                    cache_key, json.dumps(seen[-SEEN_WINDOW:])
+                )
 
             skew = time.time() - sub.baseline_ts
             if abs(skew) > 300:
@@ -372,7 +408,10 @@ class WalletWatcher:
                 )
 
             if skip_reason:
-                logger.info(
+                # WARNING, а не INFO: пропуск сделки — это то, что
+                # пользователь замечает как "бот не видит ставки".
+                # Такие строки должны быть заметны в логе.
+                logger.warning(
                     f"user={user_id}: {t.tx_hash[:18]}... пропущена "
                     f"({skip_reason})"
                 )
