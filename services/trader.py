@@ -538,6 +538,48 @@ class TraderService:
             self._position_locks[key] = lock
         return lock
 
+    async def _today_realized_loss(self, session, user_id: int) -> Decimal:
+        """
+        Сколько реально потеряно за сегодня (только закрытые позиции).
+
+        Считаем по фактически закрытым позициям: вложено минус
+        получено. Открытые не учитываем — их результат ещё не
+        определён.
+        """
+        try:
+            start_of_day = datetime.utcnow().replace(
+                hour=0, minute=0, second=0, microsecond=0
+            )
+            stmt = select(Position).where(
+                Position.user_id == user_id,
+                Position.status != "open",
+                Position.closed_at >= start_of_day,
+            )
+            rows = (await session.execute(stmt)).scalars().all()
+
+            total = Decimal("0")
+            for p_ in rows:
+                invested = Decimal(str(p_.amount_usdc or 0))
+                shares = Decimal(str(p_.shares_bought or 0))
+                exit_px = Decimal(str(p_.current_price or 0))
+                status = p_.status or ""
+
+                if status == "resolved_won":
+                    payout = shares
+                elif status == "resolved_lost":
+                    payout = Decimal("0")
+                elif status == "failed":
+                    payout = invested        # сделка не состоялась
+                else:
+                    payout = shares * exit_px
+
+                total += invested - payout   # положительное = убыток
+
+            return max(total, Decimal("0"))
+        except Exception as e:
+            logger.warning(f"_today_realized_loss: {e}")
+            return Decimal("0")
+
     async def _preflight_checks(
         self, session, user, token_id: str, amount: Decimal,
         expected_price: Decimal | None, side: str,
@@ -598,6 +640,23 @@ class TraderService:
             side,
             time.monotonic(),
         )
+
+        # ДНЕВНОЙ ЛИМИТ УБЫТКА — последний рубеж.
+        #
+        # Все остальные проверки защищают от конкретных сценариев. Этот
+        # не зависит ни от какого сценария: сколько бы ошибок ни было в
+        # коде, за сутки нельзя потерять больше заданной суммы. Дальше
+        # копирование останавливается до ручного вмешательства.
+        limit = Decimal(str(getattr(settings, "daily_loss_limit", 0)))
+        if limit > 0:
+            lost = await self._today_realized_loss(session, user.id)
+            if lost >= limit:
+                return (
+                    f"достигнут дневной лимит убытка: потеряно "
+                    f"{lost:.2f} USDC при лимите {limit} USDC. "
+                    f"Копирование остановлено до завтра или до "
+                    f"изменения DAILY_LOSS_LIMIT."
+                )
 
         # ---- Дальше идут проверки, осмысленные ТОЛЬКО для покупки ----
         #

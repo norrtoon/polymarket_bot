@@ -44,6 +44,18 @@ def _trade_key(t) -> str:
     return f"{t.tx_hash}:{t.token_id}:{t.side}"
 
 
+def _cache_key(user_id: int, wallet: str) -> str:
+    """
+    Ключ окна дедупликации — отдельный на КАЖДЫЙ кошелёк.
+
+    Привязка только к пользователю приводила к тому, что при смене
+    отслеживаемого кошелька бот видел непустой кэш от прежнего и
+    трактовал запуск как перезапуск: рубеж не выставлялся, и вся
+    недавняя история нового кошелька копировалась разом.
+    """
+    return f"recent_trade_keys:{user_id}:{(wallet or '').lower()}"
+
+
 def _fmt_ts(ts: float) -> str:
     try:
         return datetime.fromtimestamp(
@@ -161,7 +173,14 @@ class WalletWatcher:
     # ------------------------------------------------------------------
 
     async def _snapshot_baseline(self, sub: _Subscriber, wallet: str) -> bool:
-        cache_key = f"recent_trade_keys:{sub.user_id}"
+        # Ключ включает КОШЕЛЁК.
+        #
+        # Раньше он был только по user_id. При смене отслеживаемого
+        # кошелька кэш оставался заполненным ключами СТАРОГО
+        # кошелька, код считал это обычным перезапуском и не
+        # выставлял рубеж — в результате бот копировал всю недавнюю
+        # историю НОВОГО кошелька разом, пачкой в одну секунду.
+        cache_key = _cache_key(sub.user_id, wallet)
         for attempt in range(3):
             try:
                 trades = await polymarket_client.get_wallet_trades(
@@ -311,7 +330,7 @@ class WalletWatcher:
                 if trades:
                     for sub in subs.values():
                         try:
-                            await self._dispatch(sub, trades)
+                            await self._dispatch(sub, trades, wallet)
                         except Exception as e:
                             logger.error(
                                 f"dispatch user={sub.user_id}: "
@@ -335,10 +354,12 @@ class WalletWatcher:
 
             await asyncio.sleep(sleep_for)
 
-    async def _dispatch(self, sub: _Subscriber, trades: list):
+    async def _dispatch(
+        self, sub: _Subscriber, trades: list, wallet: str
+    ):
         """Отдать сделки ОДНОМУ подписчику с его дедупликацией."""
         user_id = sub.user_id
-        cache_key = f"recent_trade_keys:{user_id}"
+        cache_key = _cache_key(user_id, wallet)
 
         # Пользователь мог нажать Стоп/Старт — тогда его поколение
         # выросло, и эта подписка уже неактуальна.
@@ -372,6 +393,19 @@ class WalletWatcher:
         seen_set = set(seen_list)
 
         batch_newest = max(t.timestamp for t in trades)
+
+        # ПРЕДОХРАНИТЕЛЬ на размер пачки.
+        #
+        # Сегодня из-за ошибки в ключе кэша бот скопировал всю недавнюю
+        # историю кошелька разом — полтора десятка сделок в одну
+        # секунду, включая уже разрешившиеся рынки, и это съело весь
+        # баланс. Нормальный трейдер не совершает столько сделок
+        # мгновенно: такая пачка почти всегда означает сбой, а не
+        # реальную активность.
+        #
+        # Копируем не больше разрешённого за один опрос. Остальные
+        # помечаем виденными, чтобы они не хлынули на следующем цикле.
+        publish_budget = settings.max_copies_per_poll
 
         # Что реально вернул API — до всякой фильтрации.
         # Без этого невозможно отличить "бот отфильтровал продажу" от
@@ -428,7 +462,16 @@ class WalletWatcher:
                     f"ещё не истекло. Если это был настоящий перезаход, "
                     f"уменьшите COPY_DEDUP_WINDOW_SECONDS."
                 )
+            elif publish_budget <= 0:
+                logger.warning(
+                    f"user={user_id}: {t.tx_hash[:18]}... НЕ скопирована "
+                    f"— за один опрос уже скопировано "
+                    f"{settings.max_copies_per_poll} сделок. Похоже на "
+                    f"аномальную пачку; если это нормальная активность "
+                    f"трейдера, поднимите MAX_COPIES_PER_POLL."
+                )
             else:
+                publish_budget -= 1
                 # Прогрев начинаем ПРЯМО СЕЙЧАС, до публикации.
                 #
                 # Раньше подготовка (стакан, метаданные рынка в SDK)
