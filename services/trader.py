@@ -46,7 +46,22 @@ def _now_str() -> str:
     display_timezone_offset_hours (по умолчанию +3, Хельсинки).
     """
     tz = timezone(timedelta(hours=settings.display_timezone_offset_hours))
-    return datetime.now(tz).strftime("%H:%M:%S %d.%m.%Y")
+    # Время ПО ЧАСАМ POLYMARKET, а не сервера. Раньше показывалось время
+    # сервера, и если его часы уезжали (у тебя они расходились на час),
+    # в уведомлениях было неверное время.
+    try:
+        ts = polymarket_client.polymarket_now()
+    except Exception:
+        ts = time.time()
+    return datetime.fromtimestamp(ts, tz).strftime("%H:%M:%S %d.%m.%Y")
+
+
+def _ts_str(epoch: float | int | None) -> str:
+    """Метка времени блока Polymarket в читаемом виде."""
+    if not epoch:
+        return "—"
+    tz = timezone(timedelta(hours=settings.display_timezone_offset_hours))
+    return datetime.fromtimestamp(float(epoch), tz).strftime("%H:%M:%S")
 
 
 def _build_result_message(
@@ -1554,7 +1569,8 @@ class TraderService:
                     f"💰 Сумма: {amount:.2f} USDC\n"
                     f"📈 Цена входа: {entry_price:.4f}\n"
                     f"🎯 TP: {tp_text} | 🛑 SL: {sl_text}\n"
-                    f"🕒 Время: {_now_str()}\n"
+                    f"🕒 Трейдер: {_ts_str(trade_data.get('timestamp'))} · "
+                    f"бот: {_now_str()}\n"
                     f"⚡ Скорость: {speed_text}\n"
                     # Разбивка прямо в уведомлении: логи до вас
                     # регулярно не доходят, а по этим трём числам

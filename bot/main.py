@@ -243,7 +243,10 @@ async def main():
             _restore = [(u.id, u.target_wallet) for u in _rows]
         for _uid, _wallet in _restore:
             if _wallet:
-                await _ww.start_watching(_uid, _wallet)
+                # resume=True: это восстановление после перезапуска,
+                # а не нажатие Старта. Бот догонит сделки, которые
+                # трейдер сделал, пока контейнер пересобирался.
+                await _ww.start_watching(_uid, _wallet, resume=True)
                 logger.info(f"Слежка восстановлена после рестарта: user={_uid}")
     except Exception as _e:
         logger.error(f"Не удалось восстановить слежку: {_e}")

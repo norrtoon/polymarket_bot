@@ -28,6 +28,11 @@ from poly.client import polymarket_client, RateLimited
 
 POLL_LIMIT = 12
 BASELINE_LIMIT = 10
+# Постраничная выборка: размер страницы и потолок страниц.
+# 50 x 10 = до 500 сделок за опрос — с запасом покрывает
+# любую серию и простой при перезапуске.
+PAGE_SIZE = 50
+MAX_PAGES = 10
 SEEN_WINDOW = 200
 
 
@@ -42,6 +47,11 @@ def _trade_key(t) -> str:
     бы отдельной ставкой.
     """
     return f"{t.tx_hash}:{t.token_id}:{t.side}"
+
+
+def _cursor_key(user_id: int, wallet: str) -> str:
+    """Курсор копирования: метка времени последней обработанной сделки."""
+    return f"copy_cursor:{user_id}:{(wallet or '').lower()}"
 
 
 def _cache_key(user_id: int, wallet: str) -> str:
@@ -91,7 +101,15 @@ class WalletWatcher:
     # Публичный интерфейс
     # ------------------------------------------------------------------
 
-    async def start_watching(self, user_id: int, wallet: str):
+    async def start_watching(
+        self, user_id: int, wallet: str, resume: bool = False
+    ):
+        """
+        resume=False — пользователь нажал Старт: копируем строго с
+        этого момента, всё сделанное раньше пропускаем.
+        resume=True — автовосстановление после перезапуска бота:
+        догоняем сделки, сделанные за время простоя.
+        """
         wallet = wallet.lower().strip()
         async with self._lock:
             await self._detach_locked(user_id)
@@ -103,7 +121,7 @@ class WalletWatcher:
             # кошелька виденными, чтобы не копировать историю. Локальные
             # часы не используются — они могут расходиться с сервером
             # (у Docker Desktop на macOS это обычное дело).
-            ok = await self._snapshot_baseline(sub, wallet)
+            ok = await self._snapshot_baseline(sub, wallet, resume)
             sub.baseline_pending = not ok
 
             self._subscribers.setdefault(wallet, {})[user_id] = sub
@@ -172,106 +190,120 @@ class WalletWatcher:
     # Точка отсчёта
     # ------------------------------------------------------------------
 
-    async def _snapshot_baseline(self, sub: _Subscriber, wallet: str) -> bool:
-        # Ключ включает КОШЕЛЁК.
-        #
-        # Раньше он был только по user_id. При смене отслеживаемого
-        # кошелька кэш оставался заполненным ключами СТАРОГО
-        # кошелька, код считал это обычным перезапуском и не
-        # выставлял рубеж — в результате бот копировал всю недавнюю
-        # историю НОВОГО кошелька разом, пачкой в одну секунду.
-        cache_key = _cache_key(sub.user_id, wallet)
+    async def _snapshot_baseline(
+        self, sub: _Subscriber, wallet: str, resume: bool = False
+    ) -> bool:
+        """
+        Выставить курсор: с какой сделки начинать копирование.
+
+        Курсор — это метка времени последней обработанной сделки. Бот
+        копирует ВСЁ, что новее курсора, и после обработки сдвигает
+        его вперёд. Хранится в Redis и переживает перезапуск.
+
+        Раньше вместо курсора был фильтр по возрасту: сделка старше N
+        секунд относительно самой свежей в ответе отбрасывалась. Из-за
+        этого терялись настоящие сделки — при задержке Data API, при
+        перезапуске, при серии быстрых входов. Курсор не теряет ничего:
+        всё, что трейдер сделал после Старта, будет скопировано.
+        """
+        cursor_key = _cursor_key(sub.user_id, wallet)
+
         for attempt in range(3):
             try:
                 trades = await polymarket_client.get_wallet_trades(
                     wallet, limit=BASELINE_LIMIT
                 )
+                break
             except RateLimited:
                 await asyncio.sleep(1.5 * (attempt + 1))
-                continue
             except Exception as e:
                 logger.warning(f"baseline user={sub.user_id}: {e}")
                 return False
+        else:
+            return False
 
-            if not trades:
-                sub.baseline_ts = 0.0
-                return True
+        newest = max((t.timestamp for t in trades), default=0)
+        stored_raw = await redis_client.get(cursor_key)
+        stored = float(stored_raw) if stored_raw else None
 
-            existing_raw = await redis_client.get(cache_key)
-            is_first_ever = not existing_raw
-
-            if is_first_ever:
-                # ПЕРВЫЙ запуск слежки за этим кошельком: ставим рубеж,
-                # чтобы не скопировать всю историю трейдера.
-                sub.baseline_ts = max(t.timestamp for t in trades)
-                logger.info(
-                    f"baseline user={sub.user_id}: первый запуск, рубеж "
-                    f"{_fmt_ts(sub.baseline_ts)} — историю не копируем"
-                )
-            else:
-                # ПЕРЕЗАПУСК: рубеж НЕ сдвигаем.
-                #
-                # Раньше он выставлялся на самую свежую сделку при
-                # каждом старте, а последние 10 сделок помечались
-                # виденными. Всё, что трейдер сделал за время
-                # перезапуска контейнера, терялось безвозвратно —
-                # а при частых деплоях это происходило регулярно.
-                # Именно так пропадали сделки: бот "не видел" вход,
-                # сделанный пока он перезапускался.
-                #
-                # Сбрасывать рубеж незачем: кэш уже скопированных
-                # сделок хранится в Redis и переживает рестарт, а от
-                # копирования древней истории защищает фильтр по
-                # возрасту (max_trade_age_seconds).
-                sub.baseline_ts = 0.0
-                logger.info(
-                    f"baseline user={sub.user_id}: перезапуск — рубеж "
-                    f"не сдвигаем, сделки за время простоя будут "
-                    f"скопированы, если не старше "
-                    f"{settings.max_trade_age_seconds}с"
-                )
-
-            # Кэш дедупликации НЕ стираем, а дополняем.
+        if resume and stored is not None:
+            # АВТОВОССТАНОВЛЕНИЕ после перезапуска: догоняем простой.
             #
-            # Раньше он очищался при каждом Старте — и после Стоп ->
-            # Старт бот заново копировал сделки последних минут, потому
-            # что Data API отдаёт данные с задержкой и новая точка
-            # отсчёта оказывалась в прошлом. Позиции открывались по
-            # устаревшим ценам и мгновенно закрывались по TP/SL.
-            seen = json.loads(existing_raw) if existing_raw else []
-            if is_first_ever:
-                # Только при первом запуске помечаем текущие сделки
-                # виденными. При перезапуске этого делать НЕЛЬЗЯ:
-                # иначе сделки, сделанные во время простоя, будут
-                # записаны как уже обработанные и потеряны.
-                for t in trades:
-                    k = _trade_key(t)
-                    if k not in seen:
-                        seen.append(k)
-                await redis_client.set(
-                    cache_key, json.dumps(seen[-SEEN_WINDOW:])
-                )
-
-            skew = time.time() - sub.baseline_ts
-            if abs(skew) > 300:
+            # Но не бесконечно назад. Если бот лежал часами, сделки
+            # того времени уже неактуальны: трейдер мог давно из них
+            # выйти, цены ушли. Догоняем только разумное окно.
+            catchup = getattr(settings, "resume_catchup_seconds", 600)
+            floor = newest - catchup if newest else stored
+            cursor = max(stored, floor)
+            if cursor > stored:
                 logger.warning(
-                    f"⚠️ Часы контейнера расходятся с временем сделок "
-                    f"Polymarket на {skew / 60:.0f} мин. На копирование "
-                    f"это не влияет (сравниваем только метки API), но "
-                    f"время в уведомлениях будет неверным."
+                    f"user={sub.user_id}: бот простаивал дольше "
+                    f"{catchup}с — сделки старше {_fmt_ts(cursor)} "
+                    f"пропущены как неактуальные"
                 )
-
             logger.info(
-                f"baseline user={sub.user_id}: рубеж "
-                f"{_fmt_ts(sub.baseline_ts)}, копируем только более "
-                f"поздние сделки"
+                f"user={sub.user_id}: восстановление — копируем всё "
+                f"новее {_fmt_ts(cursor)}"
             )
-            return True
-        return False
+        else:
+            # ЯВНЫЙ СТАРТ (или первый запуск для кошелька): копируем
+            # строго с этого момента. Всё сделанное до нажатия Старта
+            # — история, её не трогаем.
+            cursor = newest
+            cache_key = _cache_key(sub.user_id, wallet)
+            seen = [_trade_key(t) for t in trades]
+            await redis_client.set(
+                cache_key, json.dumps(seen[-SEEN_WINDOW:])
+            )
+            logger.info(
+                f"user={sub.user_id}: СТАРТ — копируем все сделки "
+                f"новее {_fmt_ts(cursor)}"
+            )
 
-    # ------------------------------------------------------------------
-    # Опрос кошелька
-    # ------------------------------------------------------------------
+        sub.baseline_ts = cursor
+        await redis_client.set(cursor_key, str(cursor))
+        return True
+
+    async def _fetch_new_trades(self, wallet: str, subs: dict) -> list:
+        """
+        Забрать ВСЕ сделки новее курсора, листая страницы.
+
+        Раньше брались только последние POLL_LIMIT сделок. Если трейдер
+        делал больше между опросами (серия быстрых входов, перезапуск
+        бота, задержка Data API), всё, что не влезло в эту выборку,
+        терялось безвозвратно — бот "не видел" часть ставок.
+
+        Листаем, пока не дойдём до сделок старше самого раннего курсора
+        среди подписчиков. Потолок страниц — защита от бесконечного
+        листания, если что-то пошло не так.
+        """
+        min_cursor = min(
+            (sub.baseline_ts for sub in subs.values()), default=0.0
+        )
+
+        collected = []
+        offset = 0
+        for _page in range(MAX_PAGES):
+            page = await polymarket_client.get_wallet_trades(
+                wallet, limit=PAGE_SIZE, offset=offset
+            )
+            if not page:
+                break
+            collected.extend(page)
+
+            # Сделки идут от новых к старым. Если самая старая на
+            # странице уже не новее курсора — дальше листать незачем.
+            oldest = min(t.timestamp for t in page)
+            if oldest <= min_cursor or len(page) < PAGE_SIZE:
+                break
+            offset += PAGE_SIZE
+        else:
+            logger.warning(
+                f"{wallet[:12]}...: достигнут потолок в {MAX_PAGES} "
+                f"страниц — возможно, часть сделок не выбрана"
+            )
+
+        return collected
 
     async def _poll_wallet(self, wallet: str):
         """
@@ -303,9 +335,7 @@ class WalletWatcher:
             sleep_for = effective_interval * random.uniform(0.85, 1.15)
 
             try:
-                trades = await polymarket_client.get_wallet_trades(
-                    wallet, limit=POLL_LIMIT
-                )
+                trades = await self._fetch_new_trades(wallet, subs)
                 consecutive_rate_limits = max(
                     0, consecutive_rate_limits - 1
                 )
@@ -429,17 +459,23 @@ class WalletWatcher:
                 continue
 
             skip_reason = None
+            # Единственный временной фильтр — курсор.
+            #
+            # Сделки новее курсора копируются ВСЕ. Раньше здесь был ещё
+            # фильтр по возрасту относительно самой свежей сделки в
+            # ответе: он отбрасывал настоящие сделки при задержке Data
+            # API, при серии быстрых входов и после перезапуска. Курсор
+            # сам по себе гарантирует, что история до Старта не
+            # скопируется, а всё после — скопируется.
+            #
+            # Строго меньше: сделки с той же секундой, что и курсор,
+            # отсекаются окном уже виденных (seen_set), а не временем —
+            # иначе в одной секунде можно потерять вторую сделку.
             if t.timestamp < sub.baseline_ts:
-                skip_reason = "старее рубежа"
-            elif settings.max_trade_age_seconds and (
-                batch_newest - t.timestamp
-            ) > settings.max_trade_age_seconds:
-                # Протухшая сделка: цена рынка уже ушла, позиция
-                # открылась бы по исторической цене и мгновенно
-                # закрылась по TP/SL.
-                skip_reason = (
-                    f"устарела на {batch_newest - t.timestamp}с"
-                )
+                skip_reason = "до Старта"
+            elif t.timestamp == sub.baseline_ts and key in seen_set:
+                skip_reason = "уже обработана"
+
 
             if skip_reason:
                 # WARNING, а не INFO: пропуск сделки — это то, что
@@ -462,7 +498,7 @@ class WalletWatcher:
                     f"ещё не истекло. Если это был настоящий перезаход, "
                     f"уменьшите COPY_DEDUP_WINDOW_SECONDS."
                 )
-            elif publish_budget <= 0:
+            elif settings.max_copies_per_poll and publish_budget <= 0:
                 logger.warning(
                     f"user={user_id}: {t.tx_hash[:18]}... НЕ скопирована "
                     f"— за один опрос уже скопировано "
@@ -518,6 +554,15 @@ class WalletWatcher:
             seen_list = seen_list[-SEEN_WINDOW:]
             await redis_client.set(cache_key, json.dumps(seen_list))
 
+            # Сдвигаем курсор: эта сделка обработана. Хранится в Redis
+            # и переживает перезапуск — после рестарта бот продолжит
+            # ровно с этого места, не потеряв и не повторив ничего.
+            if t.timestamp > sub.baseline_ts:
+                sub.baseline_ts = float(t.timestamp)
+                await redis_client.set(
+                    _cursor_key(user_id, wallet), str(sub.baseline_ts)
+                )
+
     async def _claim_market_entry(self, user_id: int, t) -> bool:
         """
         Отличить транзакции ОДНОГО ордера от настоящего перезахода.
@@ -540,35 +585,64 @@ class WalletWatcher:
         """
         key = f"copied_entry:{user_id}:{t.token_id}:{t.side}"
         window = max(1, int(settings.copy_dedup_window_seconds))
+        maker_window = int(getattr(settings, "maker_fill_window_seconds", 900))
+        price = float(t.price or 0)
 
         try:
             stored = await redis_client.get(key)
 
             if stored is not None:
                 try:
-                    first_ts = int(float(stored))
+                    first_ts_s, first_px_s = (str(stored).split("|") + ["0"])[:2]
+                    first_ts = int(float(first_ts_s))
+                    first_px = float(first_px_s)
                 except (TypeError, ValueError):
-                    first_ts = None
+                    first_ts, first_px = None, 0.0
 
                 if first_ts is not None:
                     gap = abs(int(t.timestamp) - first_ts)
+
+                    # 1) Транзакции одного рыночного ордера — в пределах
+                    #    пары секунд, цена значения не имеет.
                     if gap <= window:
                         logger.info(
                             f"user={user_id}: {t.tx_hash[:18]}... — "
-                            f"часть того же ордера (разница со сделкой "
-                            f"в группе {gap}с, окно {window}с)"
+                            f"часть того же ордера (разница {gap}с, "
+                            f"окно {window}с)"
                         )
                         return False
+
+                    # 2) Куски одного ЛИМИТНОГО ордера.
+                    #
+                    # Лимитка трейдера часто исполняется частями: разные
+                    # покупатели забирают её в течение нескольких минут.
+                    # Каждая часть приходит отдельной сделкой с разным
+                    # временем — и без этой проверки бот скопировал бы
+                    # ОДНУ ставку трейдера многими полными ставками.
+                    #
+                    # Признак: части одного лимитного ордера исполняются
+                    # РОВНО по его лимитной цене. Настоящий перезаход
+                    # трейдера почти всегда идёт по другой цене.
+                    same_price = first_px > 0 and abs(price - first_px) < 0.0005
+                    if same_price and gap <= maker_window:
+                        logger.info(
+                            f"user={user_id}: {t.tx_hash[:18]}... — "
+                            f"часть того же ЛИМИТНОГО ордера (та же цена "
+                            f"{price:.4f}, прошло {gap}с) — не копируем"
+                        )
+                        return False
+
                     logger.info(
                         f"user={user_id}: {t.tx_hash[:18]}... — "
-                        f"ПЕРЕЗАХОД в {t.token_id[:12]}... "
-                        f"(прошло {gap}с с прошлого входа, окно {window}с)"
+                        f"ПЕРЕЗАХОД в {t.token_id[:12]}... (прошло {gap}с, "
+                        f"цена {first_px:.4f} -> {price:.4f})"
                     )
 
-            # Новая группа: запоминаем метку времени этой сделки.
-            # TTL щедрый — он тут только чтобы ключи не копились вечно,
-            # на логику схлопывания он больше не влияет.
-            await redis_client.set(key, str(int(t.timestamp)), ex=3600)
+            # Новая группа: запоминаем время И цену этой сделки
+            await redis_client.set(
+                key, f"{int(t.timestamp)}|{price}",
+                ex=max(3600, maker_window * 2),
+            )
             return True
 
         except Exception as e:

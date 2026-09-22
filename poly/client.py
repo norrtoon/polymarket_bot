@@ -116,6 +116,9 @@ class PolymarketClient:
         self._client_locks: dict = {}
         self._keepalive_task: asyncio.Task | None = None
         self._warm_failed_logged = False
+        # Смещение наших часов относительно Polymarket (секунды)
+        self.time_offset: float = 0.0
+        self._time_synced = False
         # Счётчик полученных 429. Вотчер читает дельту и по ней
         # подстраивает интервал опроса под реальный лимит IP.
         self.rate_limit_events: int = 0
@@ -335,13 +338,37 @@ class PolymarketClient:
     # ---------- WATCHER: чужие кошельки, Data API REST ----------
 
     async def get_wallet_trades(
-        self, wallet: str, limit: int = 5, _retry: int = 0
+        self, wallet: str, limit: int = 5, _retry: int = 0,
+        offset: int = 0,
     ) -> list[Trade]:
         await data_api_global_limiter.acquire()
         await data_api_trades_limiter.acquire()
         session = await self.http()
         url = f"{settings.data_api_base_url}/trades"
-        params = {"user": wallet, "limit": limit}
+        # offset — для постраничной выборки. Без неё бот видел только
+        # последние N сделок: если трейдер делал больше между опросами
+        # (или бот перезапускался), остальные просто не попадали в
+        # выборку и терялись.
+        params = {
+            "user": wallet,
+            "limit": limit,
+            # КЛЮЧЕВОЕ: включаем сделки, где трейдер был МЕЙКЕРОМ.
+            #
+            # По умолчанию Data API отдаёт takerOnly=true — только
+            # сделки, где трейдер СНОСИЛ заявки из стакана (рыночный
+            # ордер). Если трейдер ставил ЛИМИТНЫЙ ордер, который ждал
+            # в стакане и исполнился позже, он был мейкером — и такая
+            # сделка из выдачи выпадала целиком.
+            #
+            # Именно так и выглядело "первую покупку бот видит, а
+            # докупки и продажи нет": опытные трейдеры часто
+            # усредняются и выходят лимитками. Поле side при этом
+            # отдаётся с точки зрения пользователя (BUY/SELL — это то,
+            # что сделал ИМЕННО он), так что смысл сделки не меняется.
+            "takerOnly": "false",
+        }
+        if offset:
+            params["offset"] = offset
         try:
             async with session.get(url, params=params) as resp:
                 if resp.status == 429:
@@ -385,7 +412,7 @@ class PolymarketClient:
                     )
                     await asyncio.sleep(delay)
                     return await self.get_wallet_trades(
-                        wallet, limit, _retry + 1
+                        wallet, limit, _retry + 1, offset
                     )
                 if resp.status != 200:
                     logger.warning(f"data-api trades status={resp.status}")
@@ -727,6 +754,40 @@ class PolymarketClient:
             )
         return warmed
 
+    def _update_time_offset(self, body: str, local_mid: float) -> None:
+        """Разобрать ответ /time и обновить смещение часов."""
+        try:
+            raw = body.strip().strip('"')
+            if raw.startswith("{"):
+                import json as _json
+                data = _json.loads(raw)
+                raw = str(next(iter(data.values())))
+            server = float(raw)
+            if server > 1e12:          # пришли миллисекунды
+                server /= 1000.0
+            offset = server - local_mid
+            if abs(offset - self.time_offset) > 2:
+                logger.info(
+                    f"Время сверено с Polymarket: наши часы "
+                    f"{'отстают' if offset > 0 else 'спешат'} на "
+                    f"{abs(offset):.1f}с"
+                )
+            self.time_offset = offset
+            self._time_synced = True
+        except Exception as e:
+            logger.debug(f"разбор /time: {e}")
+
+    def polymarket_now(self) -> float:
+        """
+        Текущее время ПО ЧАСАМ POLYMARKET.
+
+        Не зависит ни от часов сервера, ни от часового пояса, ни от
+        того, где запущен бот: берётся время биржи и корректируется
+        по измеренному смещению. Если сверка ещё не прошла —
+        возвращается время сервера.
+        """
+        return time.time() + self.time_offset
+
     async def start_connection_keepalive(self, interval: float = 20.0):
         """
         Держать соединение с CLOB "горячим".
@@ -753,11 +814,17 @@ class PolymarketClient:
                 #    /book, data-api, RPC).
                 try:
                     session = await self.http()
+                    t0 = time.time()
                     async with session.get(
                         f"{settings.clob_base_url}/time",
                         timeout=aiohttp.ClientTimeout(total=4),
                     ) as resp:
-                        await resp.read()
+                        body = (await resp.read()).decode().strip()
+                    t1 = time.time()
+                    # Тот же запрос заодно даёт ВРЕМЯ БИРЖИ. Считаем
+                    # смещение наших часов относительно Polymarket с
+                    # поправкой на задержку сети (середина запроса).
+                    self._update_time_offset(body, (t0 + t1) / 2)
                 except Exception as e:
                     logger.debug(f"keepalive aiohttp: {type(e).__name__}: {e}")
 
