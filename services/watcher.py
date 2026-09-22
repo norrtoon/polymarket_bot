@@ -542,6 +542,15 @@ class WalletWatcher:
                         "question": "",
                         "outcome": t.outcome_id,
                         "detected_at": time.monotonic(),
+                        # Насколько поздно бот УВИДЕЛ сделку: время
+                        # биржи сейчас минус время блока сделки. Это
+                        # задержка Data API + интервал опроса — то, что
+                        # не видно в "скорости копирования" (та меряется
+                        # от момента обнаружения).
+                        "detect_lag_s": round(
+                            polymarket_client.polymarket_now()
+                            - float(t.timestamp), 1
+                        ),
                     })
                 )
                 logger.info(

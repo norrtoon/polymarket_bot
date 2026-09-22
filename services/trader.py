@@ -238,6 +238,8 @@ class TraderService:
         self._close_retry_notified: set[int] = set()
         # Активные задачи повторного закрытия, по одной на позицию
         self._close_retry_tasks: dict[int, asyncio.Task] = {}
+        # Задержка обнаружения текущей сделки, по токену
+        self._current_detect_lag: dict[str, float] = {}
         # Фоновый прогрев капитала: задачи по user_id и период
         self._equity_tasks: dict[int, asyncio.Task] = {}
         self._equity_refresh_interval: float = 30.0
@@ -685,6 +687,28 @@ class TraderService:
         #   * минимум в долях считался как ставка/цена, хотя продаём мы
         #     shares_bought из позиции — другое число.
         #
+        # Стакана нет = рынок закрылся. Отправлять ордер бессмысленно:
+        # биржа ответит "No orderbook exists". Так бывает, когда бот
+        # увидел сделку трейдера уже после закрытия короткого рынка
+        # (например, BTC Up/Down на 5 минут) — копия опоздала.
+        if not book or (
+            book.get("best_bid") is None and book.get("best_ask") is None
+        ):
+            return (
+                "рынок уже закрыт (стакана нет) — сделка трейдера "
+                "увидена слишком поздно"
+            )
+
+        # Слишком поздняя копия на быстром рынке хуже, чем никакой.
+        max_lag = float(getattr(settings, "max_detection_lag_seconds", 0))
+        if max_lag > 0:
+            lag = float(self._current_detect_lag.get(token_id, 0) or 0)
+            if lag > max_lag:
+                return (
+                    f"сделка трейдера увидена через {lag:.0f}с — дольше "
+                    f"лимита {max_lag:.0f}с, цена уже ушла"
+                )
+
         if side != "BUY":
             return None
 
@@ -1244,6 +1268,7 @@ class TraderService:
         # моменту проверок ответ уже готов.
         if not settings.simulation_mode:
             self._prefetch_book(token_id)
+        self._current_detect_lag[token_id] = trade_data.get("detect_lag_s", 0)
 
         # Лок НЕ держим на весь путь.
         #
@@ -1571,6 +1596,8 @@ class TraderService:
                     f"🎯 TP: {tp_text} | 🛑 SL: {sl_text}\n"
                     f"🕒 Трейдер: {_ts_str(trade_data.get('timestamp'))} · "
                     f"бот: {_now_str()}\n"
+                    f"👁 Увидел сделку через "
+                    f"{trade_data.get('detect_lag_s', '?')}с после трейдера\n"
                     f"⚡ Скорость: {speed_text}\n"
                     # Разбивка прямо в уведомлении: логи до вас
                     # регулярно не доходят, а по этим трём числам
