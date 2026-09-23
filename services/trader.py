@@ -242,6 +242,8 @@ class TraderService:
         self._current_detect_lag: dict[str, float] = {}
         # condition_id рынков из стакана (для сделок из блокчейна)
         self._book_market: dict[str, str] = {}
+        # min_order_size рынков из стакана
+        self._min_order_cache: dict[str, Decimal] = {}
         # Фоновый прогрев капитала: задачи по user_id и период
         self._equity_tasks: dict[int, asyncio.Task] = {}
         self._equity_refresh_interval: float = 30.0
@@ -655,6 +657,8 @@ class TraderService:
         # limit_price, чтобы SDK не запрашивал стакан ещё раз.
         if book.get("market"):
             self._book_market[token_id] = book["market"]
+        if book.get("min_order_size"):
+            self._min_order_cache[token_id] = book["min_order_size"]
 
         self._last_book_price[token_id] = (
             book.get("best_ask") if side == "BUY" else book.get("best_bid"),
@@ -1200,6 +1204,97 @@ class TraderService:
             return None
         return limit
 
+    async def _proportional_sell_shares(
+        self, user, token_id: str, our_total: Decimal, trader_sold: Decimal,
+    ) -> Decimal:
+        """
+        Сколько долей продать, чтобы повторить ДОЛЮ продажи трейдера.
+
+        Доля = сколько трейдер продал / сколько у него было до продажи.
+        "Было до" = его баланс сейчас (уже после продажи) + проданное.
+        Баланс читаем прямо из блокчейна: с отслеживанием по цепи
+        продажа приходит раньше, чем Data API обновит позиции трейдера,
+        и данные Data API оказались бы устаревшими.
+
+        Важно: пропорция считается от РЕАЛЬНОГО баланса трейдера, а не
+        от того, что наблюдал бот. Поэтому она верна, даже если трейдер
+        купил часть долей до нажатия Старта.
+        """
+        wallet = getattr(user, "target_wallet", None)
+        if not wallet or trader_sold <= 0:
+            logger.warning(
+                f"user={user.id}: не знаю кошелёк трейдера или размер его "
+                f"продажи — продаём всю позицию, как раньше"
+            )
+            return our_total
+
+        trader_after = await polymarket_client.get_token_balance(
+            wallet, token_id
+        )
+        if trader_after is None:
+            logger.warning(
+                f"user={user.id}: баланс трейдера не прочитан — продаём "
+                f"всю позицию (безопаснее выйти, чем остаться в рынке, "
+                f"из которого трейдер, возможно, вышел)"
+            )
+            return our_total
+
+        trader_before = trader_after + trader_sold
+        fraction = trader_sold / trader_before if trader_before > 0 else Decimal("1")
+        fraction = min(max(fraction, Decimal("0")), Decimal("1"))
+
+        # Трейдер вышел полностью (или почти) — выходим целиком, иначе
+        # останется "пыль", которую потом не продать из-за минимума.
+        full_exit = (
+            fraction >= Decimal("0.97")
+            or trader_after < Decimal("0.01")
+        )
+        if full_exit:
+            logger.info(
+                f"user={user.id}: трейдер вышел полностью "
+                f"(осталось {trader_after:.2f}) — продаём всё"
+            )
+            return our_total
+
+        target = (our_total * fraction).quantize(Decimal("0.01"))
+
+        # Минимум площадки — 5 долей (или сколько требует рынок).
+        min_shares = Decimal(str(
+            (self._min_order_cache.get(token_id)) or 5
+        ))
+        # Продаваемое количество не может быть меньше минимума рынка:
+        # округляем вверх — продать чуть больше доли трейдера безопаснее,
+        # чем пропустить продажу вовсе.
+        sell = max(target, min_shares)
+
+        # Главное — ОСТАТОК после продажи. Если он окажется меньше
+        # минимума, его потом нельзя будет продать вообще: он повиснет
+        # до разрешения рынка. Поэтому в таком случае выходим целиком.
+        #   позиция 8,  доля 33% -> продали бы 5, осталось бы 3 (< 5)
+        #   позиция 12, доля 60% -> продали бы 7.2, осталось 4.8 (< 5)
+        leftover = our_total - sell
+        if leftover < min_shares:
+            logger.info(
+                f"user={user.id}: доля {fraction:.1%} — после продажи "
+                f"осталось бы {leftover:.2f} долей, меньше минимума "
+                f"{min_shares}, такой остаток не продать — продаём всё"
+            )
+            return our_total
+
+        if sell > target:
+            logger.info(
+                f"user={user.id}: доля {fraction:.1%} = {target} долей, "
+                f"меньше минимума — продаём {sell}"
+            )
+            return sell
+
+        logger.info(
+            f"user={user.id}: трейдер продал {trader_sold:.2f} из "
+            f"{trader_before:.2f} ({fraction:.1%}) — продаём {target} "
+            f"из наших {our_total:.2f}"
+        )
+        return target
+
     async def _open_shares_for_token(
         self, session, user_id: int, token_id: str
     ) -> Decimal:
@@ -1381,10 +1476,25 @@ class TraderService:
             # закрыть позицию не мог. Берём фактический объём из своих
             # открытых позиций по этому токену.
             sell_shares = None
+            our_total = Decimal("0")
             if side == "SELL":
-                sell_shares = await self._open_shares_for_token(
+                our_total = await self._open_shares_for_token(
                     session, user_id, token_id
                 )
+                sell_shares = our_total
+                if our_total and our_total > 0:
+                    # ПРОПОРЦИОНАЛЬНАЯ продажа: продаём ту же ДОЛЮ своей
+                    # позиции, что и трейдер своей.
+                    #
+                    # Раньше бот на ЛЮБОЙ продаже трейдера продавал всё.
+                    # Трейдер фиксировал треть прибыли и держал остаток
+                    # до роста — а бот полностью выскакивал на первой же
+                    # частичной продаже, и его результат переставал
+                    # повторять результат трейдера.
+                    sell_shares = await self._proportional_sell_shares(
+                        user, token_id, our_total,
+                        Decimal(str(trade_data.get("size") or 0)),
+                    )
                 if not sell_shares or sell_shares <= 0:
                     logger.warning(
                         f"user={user_id}: трейдер ПРОДАЛ "
@@ -1646,63 +1756,109 @@ class TraderService:
                     # дубли не просто плодились — они ещё и ломали
                     # закрытие: SELL трейдера падал с исключением, и
                     # позиции оставались висеть открытыми навсегда.
-                    # Закрываем ВСЕ открытые позиции по этому токену.
+                    # Распределяем проданные доли по позициям FIFO —
+                    # от старых к новым.
+                    #
+                    # Раньше после продажи ВСЕ открытые позиции по рынку
+                    # помечались закрытыми. При пропорциональной продаже
+                    # так нельзя: бот продал бы треть, а в базе всё
+                    # оказалось бы закрытым, и оставшиеся доли повисли бы
+                    # без стоп-лосса и тейк-профита.
                     stmt = select(Position).where(
                         Position.user_id == user_id,
                         Position.token_id == token_id,
-                        Position.status == "open"
-                    )
+                        Position.status == "open",
+                    ).order_by(Position.id.asc())
                     positions = (
                         await session.execute(stmt)
                     ).scalars().all()
+
+                    remaining = Decimal(str(
+                        result.filled_size or sell_shares or 0
+                    ))
+                    eps = Decimal("0.000001")
+
                     for pos in positions:
-                        pos.status = "closed"
-                        pos.current_price = entry_price
-                        pos.closed_at = datetime.utcnow()
-                        logger.info(
-                            f"Position {pos.id} closed by SELL "
-                            f"price={entry_price}"
-                        )
-                        # Раньше подписка на WS для этого токена не
-                        # снималась НИКОГДА, если позиция закрывалась
-                        # через SELL от трейдера (а не через TP/SL или
-                        # resolution) — market_ws_manager._subscribed
-                        # только рос за всю сессию. При реконнекте весь
-                        # накопленный список уходит одним сообщением —
-                        # именно это и приводило к "1008 invalid
-                        # subscription payload".
-                        notify_user_bg(
-                            pos.user_id,
-                            _build_result_message(
-                                pos, "sell", exit_price=entry_price
-                            ),
-                        )
-                        try:
-                            from services.tp_sl_monitor import (
-                                tp_sl_monitor,
+                        if remaining <= eps:
+                            break
+                        pos_shares = Decimal(str(pos.shares_bought or 0))
+                        if pos_shares <= 0:
+                            entry = Decimal(str(pos.entry_price or 0))
+                            if entry > 0:
+                                pos_shares = (
+                                    Decimal(str(pos.amount_usdc or 0)) / entry
+                                )
+                        if pos_shares <= 0:
+                            continue
+
+                        if remaining >= pos_shares - eps:
+                            # позиция продана целиком
+                            pos.status = "closed"
+                            pos.current_price = entry_price
+                            pos.closed_at = datetime.utcnow()
+                            remaining -= pos_shares
+                            logger.info(
+                                f"Position {pos.id} closed by SELL "
+                                f"price={entry_price}"
                             )
-                            # Отписываем именно ЭТУ позицию: подписка на
-                            # токен останется, если по нему есть другие
-                            # позиции — другого пользователя или
-                            # перезаходы этого же.
-                            await tp_sl_monitor.stop_watching_position(
-                                pos.id
+                            notify_user_bg(
+                                pos.user_id,
+                                _build_result_message(
+                                    pos, "sell", exit_price=entry_price
+                                ),
                             )
-                        except Exception as e:
-                            logger.warning(
-                                f"unsubscribe on SELL close error: {e}"
+                            try:
+                                from services.tp_sl_monitor import (
+                                    tp_sl_monitor,
+                                )
+                                await tp_sl_monitor.stop_watching_position(
+                                    pos.id
+                                )
+                            except Exception as e:
+                                logger.warning(
+                                    f"unsubscribe on SELL close error: {e}"
+                                )
+                        else:
+                            # Частичная продажа: уменьшаем количество и
+                            # пропорционально вложенную сумму — чтобы
+                            # PnL оставшейся части считался от её
+                            # реальной стоимости. Мониторинг TP/SL
+                            # остаётся: позиция ещё открыта.
+                            left = pos_shares - remaining
+                            pos.amount_usdc = (
+                                Decimal(str(pos.amount_usdc or 0))
+                                * left / pos_shares
                             )
+                            pos.shares_bought = left
+                            logger.info(
+                                f"Position {pos.id}: продано "
+                                f"{remaining:.2f}, осталось {left:.2f} долей"
+                            )
+                            remaining = Decimal("0")
                 except Exception as e:
                     logger.error(f"close position on SELL error: {e}")
 
                 await session.commit()
 
+                sold_total = Decimal(str(result.filled_size or sell_shares or 0))
+                left_total = max(our_total - sold_total, Decimal("0"))
+                if left_total > Decimal("0.01"):
+                    sold_line = (
+                        f"📦 Продано {sold_total:.2f} долей, "
+                        f"осталось {left_total:.2f}\n"
+                    )
+                else:
+                    sold_line = (
+                        f"📦 Продано {sold_total:.2f} долей — "
+                        f"позиция закрыта\n"
+                    )
                 notify_user_bg(
                     user_id,
                     f"✅ <b>Скопирована сделка SELL</b>\n"
                     f"📊 Рынок: {question}\n"
                     f"🎲 Исход: <b>{outcome}</b>\n"
                     f"💵 Цена: {entry_price:.4f}\n"
+                    f"{sold_line}"
                     f"🕒 Время: {_now_str()}\n"
                     f"⚡ Скорость: {speed_text}",
                 )

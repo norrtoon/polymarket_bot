@@ -36,6 +36,9 @@ class RateLimited(Exception):
 # обеспечен USDC 1:1. Именно в нём теперь лежат "живые" деньги на
 # proxy/Safe кошельке, а не в USDC.e.
 PUSD_CONTRACT_ADDRESS = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"
+# Conditional Tokens (ERC-1155): здесь хранятся доли всех рынков.
+# Адрес по официальной документации, при переходе на V2 не менялся.
+CTF_CONTRACT_ADDRESS = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
 PUSD_DECIMALS = 6
 
 # Резервные публичные RPC Polygon. Штатный polygon-rpc.com на практике
@@ -43,6 +46,13 @@ PUSD_DECIMALS = 6
 # по нему закрыт. Перебираем по очереди, пока какой-нибудь не ответит.
 # Свой приватный эндпоинт (Alchemy/Infura/Chainstack) можно задать
 # через POLYGON_RPC_URL — он всегда пробуется первым.
+# Контракт Conditional Tokens: здесь хранятся доли (ERC1155).
+# Сверено по официальной документации Polymarket: при переходе на V2
+# адрес не менялся.
+CTF_CONTRACT = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
+# keccak256("balanceOf(address,uint256)")[:4] — стандарт ERC1155
+ERC1155_BALANCE_OF = "00fdd58e"
+
 FALLBACK_POLYGON_RPCS = [
     "https://polygon-bor-rpc.publicnode.com",
     "https://polygon.llamarpc.com",
@@ -617,6 +627,131 @@ class PolymarketClient:
             f"{last_error}. Задай рабочий эндпоинт в POLYGON_RPC_URL."
         )
         return Decimal("0")
+
+    async def _eth_call(self, to: str, data: str) -> str | None:
+        """
+        Выполнить eth_call на Polygon, перебирая RPC-эндпоинты.
+        Возвращает hex-результат или None, если ни один не ответил.
+        """
+        payload = {
+            "jsonrpc": "2.0", "id": 1, "method": "eth_call",
+            "params": [{"to": to, "data": data}, "latest"],
+        }
+        endpoints = []
+        if self._working_rpc:
+            endpoints.append(self._working_rpc)
+        if settings.polygon_rpc_url:
+            endpoints.append(settings.polygon_rpc_url)
+        endpoints.extend(FALLBACK_POLYGON_RPCS)
+        seen = set()
+        endpoints = [e for e in endpoints if e and not (e in seen or seen.add(e))]
+
+        session = await self.http()
+        for url in endpoints:
+            try:
+                async with session.post(
+                    url, json=payload, timeout=aiohttp.ClientTimeout(total=5),
+                ) as resp:
+                    if resp.status != 200:
+                        continue
+                    result = await resp.json(content_type=None)
+                if "error" in result or result.get("result") is None:
+                    continue
+                self._working_rpc = url
+                return result["result"]
+            except Exception:
+                continue
+        return None
+
+    async def get_ctf_balance(
+        self, wallet: str, token_id: str
+    ) -> Decimal | None:
+        """
+        Сколько долей токена сейчас на кошельке — прямо из блокчейна.
+
+        Доли Polymarket — это ERC-1155 токены контракта Conditional
+        Tokens (адрес не менялся при переходе на V2). Читаем
+        balanceOf(address, uint256) напрямую, без Data API: он отстаёт,
+        а для расчёта пропорции нужен баланс ровно в момент продажи.
+
+        Возвращает None, если прочитать не удалось — вызывающий код
+        должен это обработать, а не считать ноль.
+        """
+        try:
+            addr = wallet.lower().replace("0x", "").rjust(64, "0")
+            tid = format(int(token_id), "064x")
+        except (ValueError, TypeError):
+            return None
+        raw = await self._eth_call(
+            CTF_CONTRACT_ADDRESS, "0x00fdd58e" + addr + tid
+        )
+        if raw is None:
+            return None
+        try:
+            return Decimal(int(raw, 16)) / Decimal(10 ** 6)
+        except (ValueError, TypeError):
+            return None
+
+    async def get_token_balance(
+        self, wallet: str, token_id: str
+    ) -> Decimal | None:
+        """
+        Сколько долей токена у кошелька — ПРЯМО ИЗ БЛОКЧЕЙНА.
+
+        Доли Polymarket — это ERC1155 в контракте Conditional Tokens
+        (при переходе на V2 он не менялся). Читаем balanceOf напрямую
+        через RPC: это точно и мгновенно, в отличие от Data API, который
+        отстаёт на десятки секунд. Для пропорциональной продажи это
+        принципиально: при отслеживании по цепи продажа трейдера
+        приходит раньше, чем Data API успевает обновить его позиции.
+
+        Возвращает None, если прочитать не удалось — вызывающий код
+        должен сам решить, что делать без этого числа.
+        """
+        try:
+            addr = wallet.lower().replace("0x", "").rjust(64, "0")
+            tid = format(int(token_id), "064x")
+        except (ValueError, TypeError):
+            return None
+        data = f"0x{ERC1155_BALANCE_OF}{addr}{tid}"
+
+        endpoints = []
+        if self._working_rpc:
+            endpoints.append(self._working_rpc)
+        if settings.polygon_rpc_url:
+            endpoints.append(settings.polygon_rpc_url)
+        endpoints.extend(FALLBACK_POLYGON_RPCS)
+        seen = set()
+        endpoints = [e for e in endpoints if e and not (e in seen or seen.add(e))]
+
+        session = await self.http()
+        for url in endpoints:
+            try:
+                async with session.post(
+                    url,
+                    json={
+                        "jsonrpc": "2.0", "id": 1, "method": "eth_call",
+                        "params": [{"to": CTF_CONTRACT, "data": data}, "latest"],
+                    },
+                    timeout=aiohttp.ClientTimeout(total=5),
+                ) as resp:
+                    if resp.status != 200:
+                        continue
+                    result = await resp.json(content_type=None)
+                if "error" in result:
+                    continue
+                raw = result.get("result")
+                if raw is None:
+                    continue
+                self._working_rpc = url
+                if raw in ("0x", "0x0"):
+                    return Decimal("0")
+                return Decimal(int(raw, 16)) / Decimal(10 ** 6)
+            except Exception as e:
+                logger.debug(f"get_token_balance {url}: {e}")
+                continue
+        logger.warning("get_token_balance: ни один RPC не ответил")
+        return None
 
     async def get_free_usdc_balance(self, wallet: str) -> Decimal:
         """
