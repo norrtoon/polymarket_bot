@@ -240,6 +240,8 @@ class TraderService:
         self._close_retry_tasks: dict[int, asyncio.Task] = {}
         # Задержка обнаружения текущей сделки, по токену
         self._current_detect_lag: dict[str, float] = {}
+        # condition_id рынков из стакана (для сделок из блокчейна)
+        self._book_market: dict[str, str] = {}
         # Фоновый прогрев капитала: задачи по user_id и период
         self._equity_tasks: dict[int, asyncio.Task] = {}
         self._equity_refresh_interval: float = 30.0
@@ -651,6 +653,9 @@ class TraderService:
 
         # Цену из стакана запоминаем: она передаётся в ордер как
         # limit_price, чтобы SDK не запрашивал стакан ещё раз.
+        if book.get("market"):
+            self._book_market[token_id] = book["market"]
+
         self._last_book_price[token_id] = (
             book.get("best_ask") if side == "BUY" else book.get("best_bid"),
             book.get("tick_size") or Decimal("0.01"),
@@ -1540,7 +1545,12 @@ class TraderService:
 
                 position = Position(
                     user_id=user_id,
-                    market_id=trade_data.get("market_id", ""),
+                    # Для сделок из блокчейна market_id пустой —
+                    # берём из стакана. Без него не сработает погашение.
+                    market_id=(
+                        trade_data.get("market_id")
+                        or self._book_market.get(token_id, "")
+                    ),
                     outcome_id=outcome,
                     token_id=token_id,
                     entry_price=entry_price,

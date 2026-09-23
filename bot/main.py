@@ -202,6 +202,13 @@ async def main():
         ),
     ]
 
+    # Отслеживание сделок по блокчейну (если задан ALCHEMY_WS_URL)
+    try:
+        from services.onchain_watcher import onchain_watcher
+        await onchain_watcher.start()
+    except Exception as e:
+        logger.warning(f"onchain не запущен: {type(e).__name__}: {e}")
+
     # Прогреваем всё, за что иначе заплатит первая сделка:
     # геоблок, соединение с БД, TLS до биржи.
     try:

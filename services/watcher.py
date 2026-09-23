@@ -127,6 +127,13 @@ class WalletWatcher:
             self._subscribers.setdefault(wallet, {})[user_id] = sub
             self._user_wallet[user_id] = wallet
 
+            # Параллельно — отслеживание того же кошелька по блокчейну
+            try:
+                from services.onchain_watcher import onchain_watcher
+                onchain_watcher.watch(wallet)
+            except Exception as e:
+                logger.debug(f"onchain watch: {e}")
+
             if wallet not in self._wallet_tasks or \
                     self._wallet_tasks[wallet].done():
                 task = asyncio.create_task(self._poll_wallet(wallet))
@@ -163,6 +170,11 @@ class WalletWatcher:
         # чтобы не тратить квоту Data API впустую.
         if not subs:
             self._subscribers.pop(wallet, None)
+            try:
+                from services.onchain_watcher import onchain_watcher
+                onchain_watcher.unwatch(wallet)
+            except Exception:
+                pass
             task = self._wallet_tasks.pop(wallet, None)
             if task and not task.done():
                 task.cancel()
@@ -385,7 +397,8 @@ class WalletWatcher:
             await asyncio.sleep(sleep_for)
 
     async def _dispatch(
-        self, sub: _Subscriber, trades: list, wallet: str
+        self, sub: _Subscriber, trades: list, wallet: str,
+        advance_cursor: bool = True,
     ):
         """Отдать сделки ОДНОМУ подписчику с его дедупликацией."""
         user_id = sub.user_id
@@ -455,6 +468,23 @@ class WalletWatcher:
 
         for t in reversed(trades):  # от старых к новым
             key = _trade_key(t)
+            # Насколько Data API отстаёт от блокчейна — главная цифра,
+            # ради которой затевалось отслеживание по цепи. Меряем ДО
+            # проверки на дубли, чтобы замер работал и в режиме
+            # наблюдения (shadow), где сделки из цепи не копируются.
+            if advance_cursor:
+                try:
+                    from services.onchain_watcher import onchain_watcher
+                    t0 = onchain_watcher.first_seen.pop(t.tx_hash, None)
+                    if t0 is not None:
+                        logger.info(
+                            f"СРАВНЕНИЕ: Data API отстал от блокчейна "
+                            f"на {time.monotonic() - t0:.1f}с "
+                            f"(tx={t.tx_hash[:14]}...)"
+                        )
+                except Exception:
+                    pass
+
             if key in seen_set:
                 continue
 
@@ -566,10 +596,39 @@ class WalletWatcher:
             # Сдвигаем курсор: эта сделка обработана. Хранится в Redis
             # и переживает перезапуск — после рестарта бот продолжит
             # ровно с этого места, не потеряв и не повторив ничего.
-            if t.timestamp > sub.baseline_ts:
+            # События из блокчейна курсор НЕ сдвигают. Их метка — время
+            # получения, а не блока, и если бы курсор уехал вперёд, то
+            # при обрыве WebSocket сделки, которые Data API отдаст
+            # позже (со своими, чуть более ранними метками блоков),
+            # отсеялись бы как "до Старта". Курсор ведёт только опрос
+            # Data API — он и служит страховкой.
+            if advance_cursor and t.timestamp > sub.baseline_ts:
                 sub.baseline_ts = float(t.timestamp)
                 await redis_client.set(
                     _cursor_key(user_id, wallet), str(sub.baseline_ts)
+                )
+
+    async def ingest_onchain(self, wallet: str, trades: list) -> None:
+        """
+        Принять сделки, увиденные в блокчейне, и прогнать их через ТУ ЖЕ
+        логику, что и сделки из Data API: курсор, окно уже виденных,
+        схлопывание кусков одного ордера, поколения подписки.
+
+        Дубли между двумя источниками отсекаются по ключу
+        транзакция + токен + сторона: какой источник пришёл первым, тот и
+        скопирован, второй будет помечен уже обработанным.
+        """
+        wallet = (wallet or "").lower()
+        subs = dict(self._subscribers.get(wallet, {}))
+        for sub in subs.values():
+            try:
+                await self._dispatch(
+                    sub, trades, wallet, advance_cursor=False
+                )
+            except Exception as e:
+                logger.error(
+                    f"ingest_onchain user={sub.user_id}: "
+                    f"{type(e).__name__}: {e}"
                 )
 
     async def _claim_market_entry(self, user_id: int, t) -> bool:

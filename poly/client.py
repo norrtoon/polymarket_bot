@@ -934,6 +934,9 @@ class PolymarketClient:
                 return max(vals) if reverse else min(vals)
 
             return {
+                # condition_id рынка: в событии из блокчейна его нет, а
+                # без него невозможно погасить выигравшую позицию
+                "market": data.get("market") or "",
                 "best_bid": _best(data.get("bids"), reverse=True),
                 "best_ask": _best(data.get("asks"), reverse=False),
                 "min_order_size": Decimal(
