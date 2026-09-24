@@ -1404,22 +1404,46 @@ class PolymarketClient:
                     filled_size=got_shares,
                 )
             elif status == "delayed":
-                # Отложенное исполнение. Если долей ещё нет — позицию
-                # открывать нельзя по той же причине, что и с "live".
-                if got_shares <= 0:
-                    logger.warning(
-                        f"Ордер {order_id} отложен биржей и пока не "
-                        f"исполнен — позицию не открываем"
+                # "delayed" — биржа ПРИНЯЛА ордер и исполнит его с
+                # задержкой (на части рынков сведение нарочно
+                # откладывается на несколько секунд). Это НЕ отказ.
+                #
+                # Раньше при нулевом количестве в ответе ордер считался
+                # неудачей и позиция не создавалась. Но через пару
+                # секунд он исполнялся — доли появлялись на кошельке, а
+                # в базе позиции не было: ни стоп-лосса, ни
+                # тейк-профита, и продажа трейдера давала "закрывать
+                # нечего". Пользователь видел "ордер не исполнен", а
+                # ставка на рынке стояла.
+                #
+                # Теперь считаем ордер принятым с ОЦЕНКОЙ количества, а
+                # точное значение сверка возьмёт из блокчейна через
+                # несколько секунд. Если исполнения так и не будет —
+                # сверка пометит позицию несостоявшейся.
+                est_price = fill_price or price_hint or limit_price
+                if got_shares > 0:
+                    est_shares = got_shares
+                elif order_side == "SELL":
+                    est_shares = Decimal(str(shares or 0))
+                elif est_price and Decimal(str(est_price)) > 0:
+                    est_shares = (
+                        Decimal(str(amount_usdc)) / Decimal(str(est_price))
                     )
-                    return OrderResult(
-                        success=False, tx_hash=order_id,
-                        filled_price=None, filled_size=None,
-                        error="ордер отложен, исполнения пока нет",
-                    )
-                logger.warning(f"Order delayed: {order_id}")
+                else:
+                    est_shares = Decimal("0")
+
+                logger.warning(
+                    f"Ордер {order_id} принят с отложенным исполнением — "
+                    f"оценка {est_shares:.2f} долей, точное количество "
+                    f"сверим по блокчейну"
+                )
                 return OrderResult(
-                    success=True, tx_hash=order_id,
-                    filled_price=fill_price, filled_size=got_shares,
+                    success=est_shares > 0, tx_hash=order_id,
+                    filled_price=(
+                        Decimal(str(est_price)) if est_price else None
+                    ),
+                    filled_size=est_shares if est_shares > 0 else None,
+                    error="delayed",
                 )
             elif status == "live":
                 # "live" = ордер ПРИНЯТ, но стоит в стакане и НЕ

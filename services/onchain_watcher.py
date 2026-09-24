@@ -221,19 +221,28 @@ class OnChainWatcher:
 
     async def _subscribe_all(self, ws):
         """
-        На каждый кошелёк — две подписки: где он мейкер и где тейкер.
-
-        В одном фильтре нельзя сказать "мейкер ИЛИ тейкер" по разным
-        позициям топиков, поэтому подписок две. Одна сделка трейдера
-        может прийти в обеих — дубли отсекаются по хэшу транзакции.
+        На каждый кошелёк — одна подписка: события, где он мейкер.
         """
         self._resubscribe.clear()
         req_id = 1
         for wallet in sorted(self._wallets):
             t = _addr_topic(wallet)
+            # ТОЛЬКО события, где кошелёк — МЕЙКЕР.
+            #
+            # Каждый исполненный ордер трейдера даёт событие, где мейкер
+            # — он сам (для рыночного ордера тейкером контракт пишет
+            # себя). События, где трейдер указан ТЕЙКЕРОМ, — это чужие
+            # ордера, и сторона с токеном в них описывают контрагента.
+            #
+            # Раньше подписка была и на тейкерские события, и правило
+            # "тейкер против покупателя = продажа" врало, когда биржа
+            # сводила ордера на ПРОТИВОПОЛОЖНЫЕ исходы через чеканку или
+            # сжигание комплекта (цены в сумме дают ровно 1.00):
+            #   * трейдер купил Up  -> бот видел ещё "продал Down"
+            #   * трейдер продал Up -> бот видел ещё "КУПИЛ Down"
+            # Второе особенно опасно: покупка противоположного исхода.
             for topics in (
                 [ORDER_FILLED_TOPIC, None, t],          # кошелёк — мейкер
-                [ORDER_FILLED_TOPIC, None, None, t],    # кошелёк — тейкер
             ):
                 await ws.send(json.dumps({
                     "jsonrpc": "2.0", "id": req_id,
@@ -268,9 +277,10 @@ class OnChainWatcher:
         topics = log.get("topics") or []
         if len(topics) < 4:
             return
-        maker, taker = _topic_addr(topics[2]), _topic_addr(topics[3])
+        maker = _topic_addr(topics[2])
 
-        for wallet in (maker, taker):
+        # Только мейкер — см. пояснение в _subscribe_all.
+        for wallet in (maker,):
             if wallet not in self._wallets:
                 continue
             trade = decode_order_filled(log, wallet)
@@ -282,7 +292,7 @@ class OnChainWatcher:
                 for k in list(self.first_seen)[:2500]:
                     self.first_seen.pop(k, None)
 
-            role = "мейкер" if wallet == maker else "тейкер"
+            role = "свой ордер"
             logger.info(
                 f"ЦЕПЬ [{self.mode}]: {wallet[:10]}... {trade.side} "
                 f"{trade.size:.2f} долей по {trade.price:.4f} "

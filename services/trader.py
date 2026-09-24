@@ -1016,77 +1016,103 @@ class TraderService:
             return
 
         async def verify():
-            # getattr с запасным значением: если core/config.py
-            # окажется старее services/trader.py (например, при
-            # частичном обновлении репозитория), задача не должна
-            # падать с AttributeError и молча терять сверку позиции.
-            await asyncio.sleep(
-                getattr(settings, "position_verify_delay_seconds", 12)
-            )
-            try:
-                async with async_session() as session:
-                    pos = await session.get(Position, position_id)
-                    if not pos or pos.status != "open":
-                        return
-                    owner = await session.get(User, pos.user_id)
-                    if not owner or not owner.proxy_wallet:
-                        return
+            # Несколько попыток: отложенное исполнение может занять
+            # несколько секунд, а RPC — отстать на блок. Помечать позицию
+            # несостоявшейся по первой же неудачной проверке нельзя.
+            first = getattr(settings, "position_verify_delay_seconds", 12)
+            delays = [first, 15, 30]
 
-                    live = await polymarket_client.get_positions(
-                        owner.proxy_wallet
-                    )
-                    on_chain = Decimal("0")
-                    for lp in live:
-                        if lp.asset == pos.token_id:
-                            on_chain = Decimal(str(lp.size or 0))
-                            break
+            for attempt, delay in enumerate(delays, start=1):
+                await asyncio.sleep(delay)
+                try:
+                    async with async_session() as session:
+                        pos = await session.get(Position, position_id)
+                        if not pos or pos.status != "open":
+                            return
+                        owner = await session.get(User, pos.user_id)
+                        if not owner or not owner.proxy_wallet:
+                            return
 
-                    if on_chain > 0:
-                        # Позиция реальна. Заодно уточняем количество:
-                        # фактическое исполнение может отличаться от
-                        # того, что вернул ответ на ордер.
-                        recorded = Decimal(str(pos.shares_bought or 0))
-                        if recorded > 0 and abs(on_chain - recorded) > \
-                                recorded * Decimal("0.02"):
+                        # Баланс ИЗ БЛОКЧЕЙНА, а не из Data API.
+                        #
+                        # Раньше сверка спрашивала Data API, который
+                        # отстаёт на десятки секунд: он мог ещё не знать
+                        # о долях, и реальная позиция помечалась
+                        # несостоявшейся. Блокчейн отвечает сразу.
+                        on_chain = await polymarket_client.get_token_balance(
+                            owner.proxy_wallet, pos.token_id
+                        )
+                        if on_chain is None:
+                            continue        # RPC недоступен — попробуем позже
+
+                        # Доли по тому же рынку могут принадлежать и
+                        # другим нашим позициям (перезаходы) — вычитаем их.
+                        stmt = select(Position).where(
+                            Position.user_id == pos.user_id,
+                            Position.token_id == pos.token_id,
+                            Position.status == "open",
+                            Position.id != pos.id,
+                        )
+                        others = (await session.execute(stmt)).scalars().all()
+                        others_shares = sum(
+                            (Decimal(str(o.shares_bought or 0)) for o in others),
+                            Decimal("0"),
+                        )
+                        mine = on_chain - others_shares
+
+                        if mine > Decimal("0.01"):
+                            recorded = Decimal(str(pos.shares_bought or 0))
+                            if recorded <= 0 or abs(mine - recorded) > \
+                                    recorded * Decimal("0.02"):
+                                logger.info(
+                                    f"Position {pos.id}: подтверждена "
+                                    f"блокчейном, количество {recorded} -> "
+                                    f"{mine}"
+                                )
+                                pos.shares_bought = mine
+                                invested = Decimal(str(pos.amount_usdc or 0))
+                                if invested > 0:
+                                    pos.entry_price = invested / mine
+                                await session.commit()
+                            return
+
+                        if attempt < len(delays):
                             logger.info(
-                                f"Position {pos.id}: количество уточнено "
-                                f"по бирже {recorded} -> {on_chain}"
+                                f"Position {pos.id}: долей на кошельке пока "
+                                f"нет, повторная проверка через "
+                                f"{delays[attempt]}с"
                             )
-                            pos.shares_bought = on_chain
-                            await session.commit()
+                            continue
+
+                        # Все попытки исчерпаны — ордер не исполнился
+                        logger.error(
+                            f"Position {pos.id}: НЕ ПОДТВЕРЖДЕНА блокчейном "
+                            f"после {len(delays)} проверок — помечаем "
+                            f"несостоявшейся"
+                        )
+                        pos.status = "failed"
+                        pos.closed_at = datetime.utcnow()
+                        await session.commit()
+
+                        notify_user_bg(
+                            pos.user_id,
+                            f"❌ <b>Сделка НЕ состоялась</b>\n"
+                            f"📊 Рынок: {pos.token_id[:10]}...\n"
+                            f"Ордер так и не исполнился на бирже — "
+                            f"позиции нет, деньги не списаны."
+                        )
+                        try:
+                            from services.tp_sl_monitor import tp_sl_monitor
+                            await tp_sl_monitor.stop_watching_position(pos.id)
+                        except Exception:
+                            pass
                         return
 
-                    # Долей нет — ордер не исполнился
-                    logger.error(
-                        f"Position {pos.id}: НЕ ПОДТВЕРЖДЕНА биржей "
-                        f"(долей по {pos.token_id[:16]}... на кошельке "
-                        f"нет). Ордер не исполнился, помечаем как "
-                        f"несостоявшуюся."
+                except Exception as e:
+                    logger.warning(
+                        f"сверка позиции {position_id}, попытка {attempt}: "
+                        f"{type(e).__name__}: {e}"
                     )
-                    pos.status = "failed"
-                    pos.closed_at = datetime.utcnow()
-                    await session.commit()
-
-                    notify_user_bg(
-                        pos.user_id,
-                        f"❌ <b>Сделка НЕ состоялась</b>\n"
-                        f"📊 Рынок: {pos.token_id[:10]}...\n"
-                        f"Ордер не исполнился на бирже — позиции нет. "
-                        f"Предыдущее подтверждение было преждевременным, "
-                        f"деньги не списаны."
-                    )
-
-                    try:
-                        from services.tp_sl_monitor import tp_sl_monitor
-                        await tp_sl_monitor.stop_watching_position(pos.id)
-                    except Exception:
-                        pass
-
-            except Exception as e:
-                logger.warning(
-                    f"сверка позиции {position_id}: "
-                    f"{type(e).__name__}: {e}"
-                )
 
         task = asyncio.create_task(verify())
         self._prewarm_tasks.add(task)
@@ -1818,6 +1844,15 @@ class TraderService:
                 # ордер приняли, но он не исполнился, и позиция
                 # оказалась только в нашей базе.
                 self._schedule_position_verification(position.id)
+
+                if result.error == "delayed":
+                    notify_user_bg(
+                        user_id,
+                        "⏳ Биржа приняла ордер с отложенным исполнением "
+                        "(на этом рынке сведение идёт с задержкой). "
+                        "Позиция открыта по оценке, точное количество "
+                        "сверю по блокчейну в ближайшие секунды."
+                    )
 
                 logger.info(
                     f"Position opened id={position.id} user={user_id} "

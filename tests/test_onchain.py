@@ -93,3 +93,71 @@ def test_address_case_insensitive():
         WHALE,
     )
     assert t is not None
+
+
+# ---------------------------------------------------------------------
+# Чеканка и сжигание комплекта: события с ПРОТИВОПОЛОЖНЫМ исходом
+# ---------------------------------------------------------------------
+#
+# Реальный случай из лога: одна транзакция дала два события —
+#   трейдер BUY  Up   по 0.52 (его собственный ордер, мейкер)
+#   трейдер SELL Down по 0.48 (чужой ордер, трейдер в нём тейкер)
+# 0.52 + 0.48 = 1.00: биржа свела покупку Up с чужой покупкой Down,
+# выпустив полный комплект. Реальная сделка трейдера — только первая.
+# Поэтому обработчик берёт ТОЛЬКО события, где кошелёк — мейкер.
+
+UP, DOWN = 111, 222
+
+
+def make_log_token(maker, taker, side, token, maker_amt, taker_amt):
+    data = "0x" + "".join([
+        word(side), word(token),
+        word(int(maker_amt * 10**6)), word(int(taker_amt * 10**6)),
+        word(0), word(0), word(0),
+    ])
+    return {
+        "topics": [ORDER_FILLED_TOPIC, "0x" + "cd" * 32,
+                   _addr_topic(maker), _addr_topic(taker)],
+        "data": data, "transactionHash": "0xmint", "removed": False,
+    }
+
+
+def maker_only(logs, wallet):
+    """То, что делает обработчик: берём событие, только если wallet — мейкер."""
+    out = []
+    for lg in logs:
+        maker = "0x" + lg["topics"][2][-40:]
+        if maker == wallet.lower():
+            t = decode_order_filled(lg, wallet)
+            if t:
+                out.append((t.side, t.token_id))
+    return out
+
+
+EXCHANGE = "0xE111180000d2663C0091e4f400237545B87B996B"
+
+
+def test_mint_does_not_create_phantom_sell():
+    """Трейдер купил Up рыночным, биржа свела с чужой покупкой Down."""
+    logs = [
+        make_log_token(WHALE, EXCHANGE, 0, UP, 0.52, 1.0),   # свой ордер
+        make_log_token(OTHER, WHALE, 0, DOWN, 0.48, 1.0),    # чужой, WHALE — тейкер
+    ]
+    assert maker_only(logs, WHALE) == [("BUY", str(UP))], (
+        "должна быть только покупка Up, без фантомной продажи Down"
+    )
+
+
+def test_burn_does_not_create_phantom_buy_of_opposite():
+    """
+    Самый опасный случай: трейдер ПРОДАЛ Up, биржа свела с чужой
+    продажей Down через сжигание. Старое правило давало фантомную
+    ПОКУПКУ Down — бот купил бы противоположный исход.
+    """
+    logs = [
+        make_log_token(WHALE, EXCHANGE, 1, UP, 1.0, 0.52),   # свой: SELL Up
+        make_log_token(OTHER, WHALE, 1, DOWN, 1.0, 0.48),    # чужой: SELL Down
+    ]
+    result = maker_only(logs, WHALE)
+    assert ("BUY", str(DOWN)) not in result, "фантомная покупка противоположного исхода!"
+    assert result == [("SELL", str(UP))]
