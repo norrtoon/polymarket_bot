@@ -1748,7 +1748,8 @@ class TraderService:
                 # Переводим машинные ответы биржи на человеческий
                 err = result.error or "неизвестная причина"
                 low = err.lower()
-                if "no orders found to match" in low:
+                if "no orders found to match" in low \
+                        or "no resting liquidity" in low:
                     human = (
                         "в стакане не нашлось встречных заявок — "
                         "по этому рынку сейчас нет ликвидности по "

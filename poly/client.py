@@ -53,6 +53,16 @@ CTF_CONTRACT = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
 # keccak256("balanceOf(address,uint256)")[:4] — стандарт ERC1155
 ERC1155_BALANCE_OF = "00fdd58e"
 
+# Контракты биржи V2 — для понятного отчёта о выданных разрешениях.
+# Адреса сверены по нескольким источникам, включая Polygonscan.
+_SPENDER_NAMES = {
+    "0xe111180000d2663c0091e4f400237545b87b996b": "обычные рынки",
+    "0xe2222d279d744050d28e00520010520000310f59":
+        "рынки с несколькими исходами (NegRisk)",
+    "0xe2222d002000ba0053cef3375333610f64600036":
+        "рынки с несколькими исходами (NegRisk)",
+}
+
 FALLBACK_POLYGON_RPCS = [
     "https://polygon-bor-rpc.publicnode.com",
     "https://polygon.llamarpc.com",
@@ -317,12 +327,27 @@ class PolymarketClient:
         except Exception as e:
             return False, f"{type(e).__name__}: {e}"
 
-        # --- Ступень 1: может, уже всё выдано ---
-        if await self._approvals_already_granted(client):
-            return True, (
-                "разрешения уже были выданы раньше (скорее всего, при "
-                "торговле на polymarket.com) — ничего делать не нужно"
-            )
+        # --- Ступень 1: что уже выдано ---
+        status = await self._approval_status(client)
+        if status and any(status.values()):
+            lines = [
+                f"{'✅' if ok else '⛔'} {name}"
+                for name, ok in status.items()
+            ]
+            missing = [name for name, ok in status.items() if not ok]
+            text = "Торговать уже можно.\n\n" + "\n".join(lines)
+            if missing:
+                # Газлесс-выдачу здесь не запускаем: на аккаунтах через
+                # Google она отвечает "internal error". Недостающие
+                # разрешения сайт выдаст сам при первой ставке на рынке
+                # такого типа.
+                text += (
+                    "\n\nНа рынках с ⛔ ордера будут отклоняться, пока "
+                    "не выдано разрешение. Чтобы выдать его, сделайте на "
+                    "polymarket.com одну ставку на минимальную сумму на "
+                    "рынке такого типа — сайт выдаст разрешение сам."
+                )
+            return True, text
 
         # --- Ступень 2: обычная выдача ---
         try:
@@ -396,22 +421,39 @@ class PolymarketClient:
                 except Exception:
                     pass
 
-    async def _approvals_already_granted(self, client) -> bool:
+    async def _approval_status(self, client) -> dict | None:
         """
-        Выданы ли уже разрешения на залог (pUSD) всем контрактам биржи.
+        Какие контракты биржи уже могут тратить залог (pUSD) кошелька.
 
-        Проверка без транзакции: просто спрашиваем биржу. Если все
-        разрешения ненулевые — повторно выдавать незачем.
+        Возвращает {название: выдано ли} или None, если спросить не вышло.
+
+        Раньше проверка требовала разрешения ВСЕМ контрактам сразу. Но
+        сайт выдаёт их только тем, что нужны для рынка, где сделана
+        ставка: обычные рынки идут через один контракт, рынки с
+        несколькими исходами (NegRisk) — через другие. После ставки на
+        одном рынке часть разрешений нулевая, и проверка "всё или
+        ничего" ошибочно решала, что разрешений нет вовсе.
         """
         try:
             info = await client.get_balance_allowance(asset_type="COLLATERAL")
             allowances = getattr(info, "allowances", None) or {}
-            if not allowances:
-                return False
-            return all(int(v) > 0 for v in allowances.values())
         except Exception as e:
             logger.debug(f"проверка разрешений: {type(e).__name__}: {e}")
-            return False
+            return None
+
+        logger.info(f"Разрешения по контрактам: {dict(allowances)}")
+        status = {}
+        for spender, amount in allowances.items():
+            name = _SPENDER_NAMES.get(spender.lower(), f"контракт {spender[:10]}...")
+            granted = int(amount) > 0
+            # у рынков NegRisk два контракта — достаточно любого из них
+            status[name] = status.get(name, False) or granted
+        return status
+
+    async def _approvals_already_granted(self, client) -> bool:
+        """Выдано ли хоть что-то — значит, торговать уже можно."""
+        status = await self._approval_status(client)
+        return bool(status) and any(status.values())
 
     async def drop_user_client(self, user_id: int):
         client = self._user_clients.pop(user_id, None)
