@@ -105,3 +105,37 @@ async def set_sl(message: Message, state: FSMContext):
         await session.commit()
         await message.answer(status_text(user), reply_markup=main_menu_kb(user), parse_mode="HTML")
     await state.clear()
+
+
+# ----------------------------------------------------------------------
+# Докупка вслед за трейдером
+# ----------------------------------------------------------------------
+
+@router.callback_query(F.data == "menu:toggle_reentry")
+async def toggle_reentry(call: CallbackQuery):
+    """
+    Переключить режим докупки одним нажатием.
+
+    Меню перерисовывается на месте (edit_text), а не новым сообщением:
+    иначе чат засорялся бы копиями меню при каждом переключении.
+    """
+    async with async_session() as session:
+        user = await get_or_create_user(session, call.from_user.id)
+        user.allow_reentry = not bool(getattr(user, "allow_reentry", True))
+        await session.commit()
+        enabled = user.allow_reentry
+        text = status_text(user)
+        kb = main_menu_kb(user)
+
+    await call.answer(
+        "Докупка включена: копируются все входы трейдера"
+        if enabled else
+        "Докупка выключена: один вход на рынок",
+        show_alert=False,
+    )
+    try:
+        await call.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    except Exception:
+        # Сообщение могло быть слишком старым для редактирования —
+        # тогда просто присылаем новое меню.
+        await call.message.answer(text, reply_markup=kb, parse_mode="HTML")

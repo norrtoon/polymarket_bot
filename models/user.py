@@ -20,6 +20,17 @@ class User(Base):
 
     is_active: Mapped[bool] = mapped_column(Boolean, default=False)
 
+    # Докупать ли вслед за трейдером на уже открытом рынке.
+    #   True  — копируются все покупки трейдера на рынке, включая
+    #           перезаходы и усреднения;
+    #   False — на рынок заходим ОДНОЙ ставкой; повторные покупки
+    #           трейдера, пока наша позиция открыта, пропускаются.
+    # Продажи копируются всегда, независимо от этой настройки.
+    # По умолчанию True — чтобы поведение не изменилось само собой.
+    allow_reentries: Mapped[bool] = mapped_column(
+        Boolean, default=True, server_default="true"
+    )
+
     # proxy_wallet — Polymarket funder-адрес ПОЛЬЗОВАТЕЛЯ (тот, что виден
     # в Settings на polymarket.com). На нём лежат его деньги и позиции.
     proxy_wallet: Mapped[str | None] = mapped_column(String(64), nullable=True)
@@ -47,6 +58,14 @@ class User(Base):
     proxy_wallet_type: Mapped[str] = mapped_column(
         String(16), default="SAFE"
     )
+
+    # Докупать ли вслед за трейдером на том же рынке.
+    #   True  — копируются все входы трейдера, включая докупки/перезаходы
+    #   False — один вход на рынок; пока позиция открыта, докупки трейдера
+    #           пропускаются. После закрытия позиции следующий вход
+    #           трейдера копируется как новый.
+    # Продажи от этой настройки не зависят.
+    allow_reentry: Mapped[bool] = mapped_column(Boolean, default=True)
 
     # Пользователь завершил мастер настройки
     setup_completed: Mapped[bool] = mapped_column(Boolean, default=False)

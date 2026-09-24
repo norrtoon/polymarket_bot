@@ -244,6 +244,10 @@ class TraderService:
         self._book_market: dict[str, str] = {}
         # min_order_size рынков из стакана
         self._min_order_cache: dict[str, Decimal] = {}
+        # Режим «без докупки»: входы, которые выполняются прямо сейчас
+        self._single_entry_claims: dict[tuple[int, str], object] = {}
+        # Рынки, о пропуске докупки в которых уже сообщили
+        self._reentry_skip_notified: set[tuple[int, str]] = set()
         # Фоновый прогрев капитала: задачи по user_id и период
         self._equity_tasks: dict[int, asyncio.Task] = {}
         self._equity_refresh_interval: float = 30.0
@@ -1204,6 +1208,62 @@ class TraderService:
             return None
         return limit
 
+    async def _claim_single_entry(
+        self, session, user_id: int, token_id: str
+    ) -> bool:
+        """
+        Разрешить вход на рынок, только если у нас там ещё НЕТ позиции.
+
+        Отметку ставим СИНХРОННО, до первого await. Это важно: трейдер
+        часто делает несколько входов почти одновременно, и без неё два
+        параллельных обработчика оба увидели бы "позиции ещё нет" и оба
+        вошли бы — режим "без докупки" нарушился бы на первой же серии.
+        В asyncio между проверкой и добавлением в set без await никто
+        не вклинится, так что отметка атомарна.
+        """
+        key = (user_id, token_id)
+        if key in self._single_entry_claims:
+            self._log_reentry_skip(user_id, token_id, "вход уже выполняется")
+            return False
+        # Запоминаем ВЛАДЕЛЬЦА отметки — текущую задачу. Снять отметку
+        # может только он: иначе обработчик, которому отказали, на
+        # выходе снимал бы ЧУЖУЮ отметку, и следующий проходил бы.
+        # На серии из пяти одновременных входов это давало три ордера
+        # вместо одного — проверено тестом.
+        self._single_entry_claims[key] = asyncio.current_task()
+
+        open_count = await self._count_open_positions(
+            session, user_id, token_id
+        )
+        if open_count > 0:
+            self._single_entry_claims.pop(key, None)
+            self._log_reentry_skip(
+                user_id, token_id, "позиция по рынку уже открыта"
+            )
+            return False
+        # Отметка снимается в execute_copy_trade после завершения —
+        # к тому моменту позиция уже в базе и сама блокирует докупки.
+        return True
+
+    def _log_reentry_skip(self, user_id: int, token_id: str, why: str):
+        logger.info(
+            f"user={user_id}: докупка в {token_id[:12]}... пропущена — "
+            f"{why} (режим «без докупки»)"
+        )
+        # Уведомляем один раз на рынок: трейдер может сделать десятки
+        # входов, и столько же сообщений только мешали бы.
+        key = (user_id, token_id)
+        if key not in self._reentry_skip_notified:
+            self._reentry_skip_notified.add(key)
+            if len(self._reentry_skip_notified) > 5000:
+                self._reentry_skip_notified.clear()
+            notify_user_bg(
+                user_id,
+                f"🔕 Трейдер докупает в рынке {token_id[:10]}... — "
+                f"пропускаю (докупка выключена). Дальнейшие докупки "
+                f"в этом рынке тоже будут пропущены без уведомлений."
+            )
+
     async def _proportional_sell_shares(
         self, user, token_id: str, our_total: Decimal, trader_sold: Decimal,
     ) -> Decimal:
@@ -1382,9 +1442,18 @@ class TraderService:
         #
         # Лок нужен только для корректной нумерации перезаходов, а это
         # короткая операция с БД — её и защищаем, ниже по коду.
-        await self._execute_copy_trade_locked(
-            user_id, trade_data, side, token_id, copy_start_time
-        )
+        try:
+            await self._execute_copy_trade_locked(
+                user_id, trade_data, side, token_id, copy_start_time
+            )
+        finally:
+            # Снимаем отметку режима «без докупки» при ЛЮБОМ исходе —
+            # но ТОЛЬКО свою. Если вход удался, позиция уже в базе и сама
+            # блокирует докупки. Если ордер не прошёл, отметка не должна
+            # навсегда запереть рынок.
+            key = (user_id, token_id)
+            if self._single_entry_claims.get(key) is asyncio.current_task():
+                self._single_entry_claims.pop(key, None)
 
     async def _execute_copy_trade_locked(
         self,
@@ -1421,6 +1490,16 @@ class TraderService:
             if amount <= 0:
                 logger.warning(f"amount=0 user={user_id}, skip trade")
                 return
+
+            # РЕЖИМ "без докупки": один вход на рынок.
+            #
+            # Проверяем ДО всех сетевых запросов — пропуск должен
+            # стоить ноль времени и не тратить квоту API.
+            if side == "BUY" and not getattr(user, "allow_reentry", True):
+                if not await self._claim_single_entry(
+                    session, user_id, token_id
+                ):
+                    return
 
             logger.info(
                 f"Executing copy trade user={user_id} side={side} "
