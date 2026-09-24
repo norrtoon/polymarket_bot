@@ -1760,6 +1760,20 @@ class TraderService:
                         f"сумма ставки ниже минимума площадки. "
                         f"Увеличьте ставку (сейчас {amount:.2f} USDC)."
                     )
+                elif "signer address has to be the address of the api key" in low:
+                    # Ордер подписан одним кошельком, а API-ключ биржи
+                    # принадлежит другому. Почти всегда это аккаунт через
+                    # Google/почту, к которому подключили ключ MetaMask,
+                    # либо CLOB-креды, скопированные с сайта для другого
+                    # кошелька.
+                    human = (
+                        "ключ и API-ключ биржи принадлежат разным "
+                        "кошелькам. Если аккаунт Polymarket создан через "
+                        "Google или почту — нужен его собственный ключ с "
+                        "reveal.magic.link/polymarket, а не ключ MetaMask. "
+                        "Пройдите /setup заново и на шагах CLOB API "
+                        "отправляйте «-»."
+                    )
                 elif "not enough balance" in low or "insufficient" in low \
                         or "allowance" in low:
                     # Биржа отвечает ОДНОЙ фразой "not enough balance /

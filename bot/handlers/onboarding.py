@@ -56,6 +56,50 @@ async def _safe_delete(message: Message):
         logger.debug(f"не удалось удалить сообщение с секретом: {e}")
 
 
+async def _verify_wallet_matches_key(user_id: int) -> str | None:
+    """
+    Проверить, что введённый ключ управляет введённым адресом Polymarket.
+    Возвращает текст ошибки для пользователя или None, если всё в порядке.
+    """
+    from core.config import settings as _settings
+    if _settings.simulation_mode:
+        return None     # в симуляции ордера не уходят — проверять нечего
+
+    from poly.client import polymarket_client
+    async with async_session() as session:
+        user = await get_or_create_user(session, user_id)
+        try:
+            await polymarket_client.secure_for_user(user)
+            return None
+        except Exception as e:
+            err = str(e)
+
+    await polymarket_client.drop_user_client(user_id)
+
+    if "не принадлежит" in err or "does not match the signer" in err:
+        return (
+            "❌ <b>Ключ не подходит к этому аккаунту Polymarket</b>\n\n"
+            "Адрес из шага 1 не управляется введённым приватным ключом.\n\n"
+            "<b>Если аккаунт Polymarket создан через Google или почту</b> — "
+            "ключ MetaMask ему не подходит. У таких аккаунтов свой ключ, "
+            "его хранит сервис Magic. Экспортировать его можно так:\n"
+            "1. Войдите на polymarket.com через Google\n"
+            "2. Откройте <code>reveal.magic.link/polymarket</code>\n"
+            "3. Нажмите Reveal Private Key и скопируйте ключ\n\n"
+            "<b>Если аккаунт через MetaMask</b> — проверьте, что адрес "
+            "скопирован из polymarket.com → Settings того же аккаунта, "
+            "которым вы входите в MetaMask.\n\n"
+            "На шагах CLOB API отправляйте <code>-</code>: бот сам получит "
+            "креды из ключа. Креды, скопированные с сайта, часто относятся "
+            "к другому кошельку.\n\n"
+            "Пройдите /setup заново."
+        )
+    return (
+        f"⚠️ Не удалось проверить кошелёк: <code>{err[:200]}</code>\n"
+        f"Проверьте данные и пройдите /setup заново."
+    )
+
+
 @router.callback_query(F.data == "menu:setup")
 @router.message(Command("setup"))
 async def setup_start(event, state: FSMContext):
@@ -144,6 +188,12 @@ async def setup_proxy(message: Message, state: FSMContext):
         "<b>Шаг 2 из 5 — приватный ключ</b>\n\n"
         "Пришлите приватный ключ кошелька, которым вы входите в Polymarket "
         "(64 символа, можно с префиксом 0x).\n\n"
+        "<b>Как вы входите в Polymarket?</b>\n"
+        "• <b>Через MetaMask</b> — ключ из MetaMask: Account details → "
+        "Show private key.\n"
+        "• <b>Через Google или почту</b> — ключ MetaMask НЕ подойдёт. "
+        "Войдите на polymarket.com и откройте "
+        "<code>reveal.magic.link/polymarket</code> → Reveal Private Key.\n\n"
         "🔒 Сообщение будет <b>удалено сразу</b> после обработки, ключ "
         "сохранится зашифрованным.",
         parse_mode="HTML",
@@ -247,6 +297,24 @@ async def setup_clob_passphrase(message: Message, state: FSMContext):
         await polymarket_client.drop_user_client(message.from_user.id)
     except Exception:
         pass
+
+    # ПРОВЕРКА СРАЗУ: принадлежит ли кошелёк введённому ключу.
+    #
+    # Раньше несовпадение обнаруживалось только на первой сделке — и то
+    # непонятной ошибкой биржи вроде "the order signer address has to be
+    # the address of the API KEY". Типичный случай: аккаунт Polymarket
+    # создан через Google или почту, а подключают ключ MetaMask. У таких
+    # аккаунтов свой ключ, который хранит сервис Magic, и ключ MetaMask
+    # ими не управляет.
+    check_error = await _verify_wallet_matches_key(message.from_user.id)
+    if check_error:
+        async with async_session() as session:
+            user = await get_or_create_user(session, message.from_user.id)
+            user.setup_completed = False
+            await session.commit()
+        await state.clear()
+        await message.answer(check_error, parse_mode="HTML")
+        return
 
     async with async_session() as session:
         user = await get_or_create_user(session, message.from_user.id)
