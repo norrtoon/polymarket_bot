@@ -237,6 +237,19 @@ async def setup_clob_passphrase(message: Message, state: FSMContext):
         user = await get_or_create_user(session, message.from_user.id)
         user.setup_completed = True
         await session.commit()
+
+    # Клиент биржи кэшируется на пользователя и иначе жил бы со СТАРЫМ
+    # адресом и ключом до перезапуска бота: поправленные в /setup данные
+    # не применились бы, и ордера продолжали бы уходить не с того
+    # кошелька. Сбрасываем — следующий ордер создаст клиента заново.
+    try:
+        from poly.client import polymarket_client
+        await polymarket_client.drop_user_client(message.from_user.id)
+    except Exception:
+        pass
+
+    async with async_session() as session:
+        user = await get_or_create_user(session, message.from_user.id)
         text = status_text(user)
         kb = main_menu_kb(user)
 
@@ -296,6 +309,13 @@ async def forget_keys(message: Message, state: FSMContext):
         user.setup_completed = False
         user.is_active = False
         await session.commit()
+
+    # Сбрасываем закэшированный клиент биржи с удалёнными ключами
+    try:
+        from poly.client import polymarket_client
+        await polymarket_client.drop_user_client(message.from_user.id)
+    except Exception:
+        pass
 
     try:
         from services.watcher import wallet_watcher

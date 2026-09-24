@@ -252,8 +252,44 @@ class PolymarketClient:
                     except TypeError:
                         credentials = None
 
-            client = await AsyncSecureClient.create(
-                private_key=pk, credentials=credentials,
+            # Адрес кошелька передаём ЯВНО.
+            #
+            # Без него SDK торгует от "Deposit Wallet" — адреса, который
+            # сам выводит из ключа. Но деньги пользователя лежат там, где
+            # их держит Polymarket: у аккаунтов через MetaMask это Gnosis
+            # Safe, через почту — отдельный прокси. Это ДРУГИЕ адреса.
+            # В итоге кнопка "Баланс" читала правильный адрес и
+            # показывала деньги, а ордер уходил с пустого кошелька:
+            # "not enough balance".
+            #
+            # Когда адрес передан, SDK сам сверяет его с ключом и
+            # определяет тип (EOA / POLY_PROXY / GNOSIS_SAFE /
+            # DEPOSIT_WALLET), а если адрес ключу не принадлежит —
+            # явно отказывает, вместо того чтобы молча торговать
+            # с другого кошелька.
+            wallet_addr = getattr(user, "proxy_wallet", None) or None
+            try:
+                client = await AsyncSecureClient.create(
+                    private_key=pk, credentials=credentials,
+                    wallet=wallet_addr,
+                )
+            except Exception as e:
+                if "does not match the signer" in str(e):
+                    raise RuntimeError(
+                        "адрес Polymarket из /setup не принадлежит "
+                        "введённому приватному ключу. Проверьте, что "
+                        "адрес скопирован из polymarket.com → Settings "
+                        "именно того аккаунта, от которого ключ"
+                    ) from e
+                raise
+
+            wtype = (
+                getattr(getattr(client, "_ctx", None), "wallet_type", None)
+                or "определён SDK"
+            )
+            logger.info(
+                f"Клиент биржи для user={user.id}: торговля от "
+                f"{(wallet_addr or 'Deposit Wallet')[:12]}..., тип {wtype}"
             )
             await client.__aenter__()
             self._user_clients[user.id] = client

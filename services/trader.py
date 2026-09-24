@@ -186,6 +186,60 @@ def _build_result_message(
     return "\n".join(lines)
 
 
+def _explain_balance_error(err: str) -> str:
+    """
+    Понять по ответу биржи, чего на самом деле не хватает.
+
+    Биржа присылает, например:
+      not enough balance / allowance: the balance is not enough ->
+      balance: 6715647, sum of matched orders: 5245000,
+      order amount (inc. fees): 2671500
+    Суммы в атомарных единицах (6 знаков после запятой).
+    """
+    import re as _re
+
+    def _num(name):
+        m = _re.search(name + r"\s*:\s*(\d+)", err)
+        return Decimal(m.group(1)) / Decimal(10 ** 6) if m else None
+
+    balance = _num(r"balance")
+    matched = _num(r"sum of matched orders") or Decimal("0")
+    order = _num(r"order amount(?: \(inc\. fees\))?")
+
+    if balance is not None and order is not None:
+        available = balance - matched
+        if balance == 0:
+            # Биржа видит НОЛЬ на кошельке, с которого идёт ордер. Чаще
+            # всего это значит, что ордер уходит не с того адреса, где
+            # лежат деньги, — а кнопка "Баланс" при этом показывает
+            # деньги, потому что читает другой адрес.
+            return (
+                "биржа видит 0 на кошельке, с которого уходит ордер. "
+                "Проверьте, что в /setup указан адрес Polymarket "
+                "(polymarket.com → Settings) того же аккаунта, что и "
+                "приватный ключ, а затем выполните /approve."
+            )
+        if available >= order:
+            # Денег хватает — значит не выданы разрешения
+            return (
+                f"средств достаточно ({available:.2f} USDC), но не выданы "
+                f"разрешения контрактам биржи — выполните /approve."
+            )
+        return (
+            f"недостаточно средств: доступно {available:.2f} USDC"
+            + (f" (ещё {matched:.2f} заняты в исполняющихся ордерах)"
+               if matched > 0 else "")
+            + f", а ордер требует {order:.2f} USDC с комиссией."
+        )
+
+    if "allowance" in err.lower():
+        return (
+            "недостаточно средств или не выданы разрешения контрактам "
+            "биржи. Проверьте баланс и выполните /approve."
+        )
+    return "недостаточно средств на кошельке."
+
+
 class _UserSnapshot:
     """
     Отсоединённая копия полей пользователя.
@@ -1706,13 +1760,15 @@ class TraderService:
                         f"сумма ставки ниже минимума площадки. "
                         f"Увеличьте ставку (сейчас {amount:.2f} USDC)."
                     )
-                elif "not enough balance" in low or "insufficient" in low:
-                    human = "недостаточно средств на кошельке."
-                elif "allowance" in low:
-                    human = (
-                        "не выданы разрешения контрактам биржи — "
-                        "выполните /approve."
-                    )
+                elif "not enough balance" in low or "insufficient" in low \
+                        or "allowance" in low:
+                    # Биржа отвечает ОДНОЙ фразой "not enough balance /
+                    # allowance" и на нехватку денег, и на отсутствие
+                    # разрешений. Раньше здесь всегда писалось
+                    # "недостаточно средств" — даже когда деньги были,
+                    # а не хватало разрешений. Различаем по цифрам,
+                    # которые биржа присылает в том же сообщении.
+                    human = _explain_balance_error(err)
                 else:
                     human = err
 
