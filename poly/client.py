@@ -298,28 +298,120 @@ class PolymarketClient:
 
     async def ensure_trading_approvals(self, user) -> tuple[bool, str]:
         """
-        Выдать разрешения контрактам биржи (allowances).
+        Выдать разрешения контрактам биржи — в три ступени.
 
-        Без них биржа отклоняет ордера: кошелёк не разрешил контрактам
-        распоряжаться своим pUSD и Conditional Tokens. Это разовая
-        операция на кошелёк, но раньше её не было в коде вообще —
-        первый же боевой ордер отклонялся.
-
-        Метод SDK setup_trading_approvals() сам пропускает уже
-        выданные разрешения, поэтому повторный вызов безопасен.
+        1. Проверяем, не выданы ли они УЖЕ. Если аккаунтом хоть раз
+           торговали на polymarket.com, сайт выдал их сам — транзакция
+           не нужна вовсе.
+        2. Пробуем выдать обычным способом.
+        3. Если кошелёк — смарт-контракт (Safe или прокси аккаунта через
+           Google/почту), транзакцию нужно провести через газлесс-сервис
+           Polymarket (релейер), а ему нужен Builder API Key. SDK умеет
+           выпустить такой ключ сам — выпускаем и повторяем.
         """
         if settings.simulation_mode:
             return True, "симуляция — разрешения не нужны"
+
         try:
             client = await self.secure_for_user(user)
+        except Exception as e:
+            return False, f"{type(e).__name__}: {e}"
+
+        # --- Ступень 1: может, уже всё выдано ---
+        if await self._approvals_already_granted(client):
+            return True, (
+                "разрешения уже были выданы раньше (скорее всего, при "
+                "торговле на polymarket.com) — ничего делать не нужно"
+            )
+
+        # --- Ступень 2: обычная выдача ---
+        try:
             handle = await client.setup_trading_approvals()
             if handle is not None and hasattr(handle, "wait"):
                 await handle.wait()
             return True, "разрешения выданы"
         except Exception as e:
-            msg = f"{type(e).__name__}: {e}"
-            logger.error(f"ensure_trading_approvals user={user.id}: {msg}")
-            return False, msg
+            first_error = f"{type(e).__name__}: {e}"
+            needs_relayer = (
+                "gasless" in str(e).lower()
+                or "builder api key" in str(e).lower()
+                or "relayer api key" in str(e).lower()
+            )
+            if not needs_relayer:
+                logger.error(
+                    f"ensure_trading_approvals user={user.id}: {first_error}"
+                )
+                return False, first_error
+
+        # --- Ступень 3: через релейер с Builder API Key ---
+        #
+        # Кошелёк аккаунта через Google/почту или MetaMask-Safe — это
+        # смарт-контракт: сам он транзакцию не подпишет, её проводит
+        # релейер Polymarket без газа. Для этого SDK нужен Builder API
+        # Key. Выпускаем его от имени этого же аккаунта.
+        logger.info(
+            f"user={user.id}: кошелёк требует газлесс-выдачи разрешений — "
+            f"выпускаю Builder API Key"
+        )
+        relayed = None
+        try:
+            builder_key = await client.create_builder_api_key()
+
+            from core import crypto
+            pk = crypto.decrypt(getattr(user, "private_key_enc", None))
+            relayed = await AsyncSecureClient.create(
+                private_key=pk,
+                wallet=getattr(user, "proxy_wallet", None) or None,
+                api_key=builder_key,
+            )
+            await relayed.__aenter__()
+            handle = await relayed.setup_trading_approvals()
+            if handle is not None and hasattr(handle, "wait"):
+                await handle.wait()
+
+            # Проверяем, что разрешения действительно появились
+            if await self._approvals_already_granted(relayed):
+                return True, "разрешения выданы через газлесс-сервис Polymarket"
+            return True, (
+                "запрос на выдачу разрешений отправлен через газлесс-сервис; "
+                "применение может занять до минуты"
+            )
+        except Exception as e:
+            logger.error(
+                f"газлесс-выдача разрешений user={user.id}: "
+                f"{type(e).__name__}: {e}"
+            )
+            return False, (
+                f"автоматически выдать разрешения не удалось "
+                f"({type(e).__name__}: {e}).\n\n"
+                f"Самый простой способ: зайдите на polymarket.com этим же "
+                f"аккаунтом и сделайте одну ставку вручную на минимальную "
+                f"сумму. Сайт сам выдаст разрешения, после этого бот "
+                f"сможет торговать."
+            )
+        finally:
+            if relayed is not None:
+                try:
+                    await relayed.__aexit__(None, None, None)
+                except Exception:
+                    pass
+
+    async def _approvals_already_granted(self, client) -> bool:
+        """
+        Выданы ли уже разрешения на залог (pUSD) всем контрактам биржи.
+
+        Проверка без транзакции: просто спрашиваем биржу. Если все
+        разрешения ненулевые — повторно выдавать незачем.
+        """
+        try:
+            info = await client.get_balance_allowance(asset_type="COLLATERAL")
+            allowances = getattr(info, "allowances", None) or {}
+            if not allowances:
+                return False
+            return all(int(v) > 0 for v in allowances.values())
+        except Exception as e:
+            logger.debug(f"проверка разрешений: {type(e).__name__}: {e}")
+            return False
 
     async def drop_user_client(self, user_id: int):
         client = self._user_clients.pop(user_id, None)

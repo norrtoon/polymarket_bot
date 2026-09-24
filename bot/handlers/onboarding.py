@@ -357,9 +357,16 @@ async def approve_allowances(message: Message):
             f"Теперь бот может размещать ордера от вашего имени."
         )
     else:
+        # Подсказку про газ даём, только если ошибка действительно о нём.
+        # Раньше она добавлялась всегда — а кошельки аккаунтов через
+        # Google/почту и Safe выдают разрешения без газа, через
+        # релейер Polymarket, и совет про MATIC только сбивал с толку.
+        gas_hint = ""
+        low = detail.lower()
+        if "gas" in low and "gasless" not in low or "insufficient funds" in low:
+            gas_hint = "\n\nПохоже, на кошельке не хватает POL (MATIC) на газ."
         await message.answer(
-            f"❌ Не удалось выдать разрешения:\n<code>{detail}</code>\n\n"
-            f"Проверьте, что на кошельке есть немного MATIC на газ.",
+            f"❌ Не удалось выдать разрешения:\n{detail}{gas_hint}",
             parse_mode="HTML",
         )
 
