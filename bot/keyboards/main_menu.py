@@ -17,6 +17,14 @@ def main_menu_kb(user: User) -> InlineKeyboardMarkup:
         text="🔁 Докупка: ВКЛ" if reentry_on else "1️⃣ Докупка: ВЫКЛ",
         callback_data="menu:toggle_reentry",
     )
+    min_trade = getattr(user, "min_trader_trade_usdc", None) or 0
+    b.button(
+        text=(
+            f"🔍 Мин. сделка: {float(min_trade):g}$"
+            if min_trade else "🔍 Мин. сделка: любая"
+        ),
+        callback_data="menu:min_trade",
+    )
     if user.is_active:
         b.button(text="⏹️ Стоп", callback_data="menu:stop")
     else:
@@ -31,6 +39,11 @@ def status_text(user: User) -> str:
     tp = f"{user.tp_percent}%" if user.tp_percent else "—"
     sl = f"{user.sl_percent}%" if user.sl_percent else "—"
     mode = f"{user.bet_amount} USDC" if user.bet_mode == "fixed" else f"{user.bet_percent}% от капитала"
+    _mt = getattr(user, "min_trader_trade_usdc", None) or 0
+    min_trade_text = (
+        f"от {float(_mt):g} USDC (мельче — не копируются)"
+        if _mt else "любая"
+    )
     reentry = (
         "включена — копируются все входы трейдера"
         if getattr(user, "allow_reentry", True)
@@ -42,5 +55,6 @@ def status_text(user: User) -> str:
         f"Кошелёк: <code>{wallet}</code>\n"
         f"Ставка: {mode}\n"
         f"TP: {tp} | SL: {sl}\n"
-        f"Докупка: {reentry}"
+        f"Докупка: {reentry}\n"
+        f"Мин. сделка трейдера: {min_trade_text}"
     )

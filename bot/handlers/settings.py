@@ -16,6 +16,10 @@ class AmountFSM(StatesGroup):
     waiting_value = State()
 
 
+class MinTradeFSM(StatesGroup):
+    waiting_value = State()
+
+
 class TpSlFSM(StatesGroup):
     waiting_tp = State()
     waiting_sl = State()
@@ -139,3 +143,62 @@ async def toggle_reentry(call: CallbackQuery):
         # Сообщение могло быть слишком старым для редактирования —
         # тогда просто присылаем новое меню.
         await call.message.answer(text, reply_markup=kb, parse_mode="HTML")
+
+
+
+# ----------------------------------------------------------------------
+# Минимальный размер сделки трейдера
+# ----------------------------------------------------------------------
+
+@router.callback_query(F.data == "menu:min_trade")
+async def ask_min_trade(call: CallbackQuery, state: FSMContext):
+    await call.answer()
+    async with async_session() as session:
+        user = await get_or_create_user(session, call.from_user.id)
+        current = getattr(user, "min_trader_trade_usdc", None) or 0
+
+    now = f"{float(current):g} USDC" if current else "не задан — копируются любые"
+    await call.message.answer(
+        "🔍 <b>Минимальный размер сделки трейдера</b>\n\n"
+        f"Сейчас: {now}\n\n"
+        "Бот не будет копировать ПОКУПКИ трейдера меньше этой суммы.\n\n"
+        "Зачем: крупные трейдеры часто делают мелкие сделки — хвосты "
+        "своих лимитных ордеров, скрытый набор позиции мелкими частями, "
+        "а иногда и приманку для копировщиков. При фиксированной ставке "
+        "доллар трейдера превращается в вашу полную ставку.\n\n"
+        "Продажи фильтр не затрагивает — бот всегда выходит вслед за "
+        "трейдером.\n\n"
+        "Введите сумму в USDC (например: 20) или <code>0</code>, чтобы "
+        "копировать любые:",
+        parse_mode="HTML",
+    )
+    await state.set_state(MinTradeFSM.waiting_value)
+
+
+@router.message(MinTradeFSM.waiting_value)
+async def set_min_trade(message: Message, state: FSMContext):
+    raw = (message.text or "").strip().replace(",", ".").rstrip("$").strip()
+    try:
+        value = Decimal(raw)
+        if value < 0 or value > Decimal("1000000"):
+            raise InvalidOperation
+    except (InvalidOperation, ValueError):
+        await message.answer(
+            "❌ Введите число от 0 (например: 20). 0 — копировать любые."
+        )
+        return
+
+    async with async_session() as session:
+        user = await get_or_create_user(session, message.from_user.id)
+        user.min_trader_trade_usdc = value if value > 0 else None
+        await session.commit()
+        text = status_text(user)
+        kb = main_menu_kb(user)
+
+    await state.clear()
+    await message.answer(
+        f"✅ Теперь копируются покупки трейдера от {value:g} USDC"
+        if value > 0 else
+        "✅ Фильтр выключен — копируются любые покупки трейдера"
+    )
+    await message.answer(text, reply_markup=kb, parse_mode="HTML")

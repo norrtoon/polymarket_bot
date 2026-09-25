@@ -280,20 +280,21 @@ class TraderService:
         self._constraints_cache: dict[str, dict] = {}
         # Цена из стакана, полученная в проверках — передаём её в
         # ордер, чтобы SDK не запрашивал стакан ещё раз
-        self._last_book_price: dict[str, tuple] = {}
+        self._last_book_price: dict[str, dict] = {}
         # Предзапросы стакана, запущенные до основных проверок
         self._book_inflight: dict[str, asyncio.Task] = {}
         # Фоновые задачи прогрева, запущенные при обнаружении сделки
         self._prewarm_tasks: set[asyncio.Task] = set()
         self._timings: list[float] = []
         # Суммы, поднятые до минимума рынка в проверках
-        self._bumped_amount: dict[str, Decimal] = {}
+        # Ключ (пользователь, рынок): у каждого своя ставка
+        self._bumped_amount: dict[tuple[int, str], Decimal] = {}
         # Позиции, о неудачном закрытии которых уже сообщили
         self._close_retry_notified: set[int] = set()
         # Активные задачи повторного закрытия, по одной на позицию
         self._close_retry_tasks: dict[int, asyncio.Task] = {}
         # Задержка обнаружения текущей сделки, по токену
-        self._current_detect_lag: dict[str, float] = {}
+        self._current_detect_lag: dict[tuple[int, str], float] = {}
         # condition_id рынков из стакана (для сделок из блокчейна)
         self._book_market: dict[str, str] = {}
         # min_order_size рынков из стакана
@@ -718,12 +719,17 @@ class TraderService:
         if book.get("min_order_size"):
             self._min_order_cache[token_id] = book["min_order_size"]
 
-        self._last_book_price[token_id] = (
-            book.get("best_ask") if side == "BUY" else book.get("best_bid"),
-            book.get("tick_size") or Decimal("0.01"),
-            side,
-            time.monotonic(),
-        )
+        # Храним ОБЕ цены стакана, без привязки к стороне сделки.
+        # Раньше здесь лежала одна цена вместе со стороной той сделки,
+        # что прошла последней. При одновременной покупке одного
+        # пользователя и продаже другого по тому же рынку покупка могла
+        # взять цену, рассчитанную для продажи, и наоборот.
+        self._last_book_price[token_id] = {
+            "bid": book.get("best_bid"),
+            "ask": book.get("best_ask"),
+            "tick": book.get("tick_size") or Decimal("0.01"),
+            "ts": time.monotonic(),
+        }
 
         # ДНЕВНОЙ ЛИМИТ УБЫТКА — последний рубеж.
         #
@@ -769,7 +775,9 @@ class TraderService:
         # Слишком поздняя копия на быстром рынке хуже, чем никакой.
         max_lag = float(getattr(settings, "max_detection_lag_seconds", 0))
         if max_lag > 0:
-            lag = float(self._current_detect_lag.get(token_id, 0) or 0)
+            lag = float(
+                self._current_detect_lag.get((user.id, token_id), 0) or 0
+            )
             if lag > max_lag:
                 return (
                     f"сделка трейдера увидена через {lag:.0f}с — дольше "
@@ -827,7 +835,7 @@ class TraderService:
                             f"пройти минимум {min_shares} долей "
                             f"при цене {expected_price:.4f}"
                         )
-                        self._bumped_amount[token_id] = need
+                        self._bumped_amount[(user.id, token_id)] = need
                         return None
 
                     return (
@@ -917,7 +925,7 @@ class TraderService:
         entry = self._last_book_price.get(token_id)
         if not entry:
             return None
-        price, tick, _side, _ts = entry
+        price, tick = entry["bid"], entry["tick"]
         if not price:
             return None
         tick = Decimal(str(tick or "0.01"))
@@ -1245,7 +1253,9 @@ class TraderService:
                 pass
         return await polymarket_client.get_book_snapshot(token_id)
 
-    def _book_price_for(self, token_id: str) -> Decimal | None:
+    def _book_price_for(
+        self, token_id: str, side: str
+    ) -> Decimal | None:
         """
         Предельная цена для ордера — с ШИРОКИМ запасом.
 
@@ -1261,10 +1271,11 @@ class TraderService:
         исполнение, но позволяет SDK подписать ордер сразу.
         """
         entry = self._last_book_price.get(token_id)
-        if not entry:
+        if not entry or time.monotonic() - entry["ts"] > 15:
             return None
-        price, tick, side, taken_at = entry
-        if price is None or time.monotonic() - taken_at > 15:
+        price = entry["ask"] if side == "BUY" else entry["bid"]
+        tick = entry["tick"]
+        if price is None:
             return None
 
         tick = Decimal(str(tick or "0.01"))
@@ -1508,7 +1519,9 @@ class TraderService:
         # моменту проверок ответ уже готов.
         if not settings.simulation_mode:
             self._prefetch_book(token_id)
-        self._current_detect_lag[token_id] = trade_data.get("detect_lag_s", 0)
+        self._current_detect_lag[(user_id, token_id)] = (
+            trade_data.get("detect_lag_s", 0)
+        )
 
         # Лок НЕ держим на весь путь.
         #
@@ -1566,6 +1579,25 @@ class TraderService:
             # записью позиции, под коротким локом. Здесь он не нужен.
             entry_number = 1
 
+            # Фильтр мелких сделок трейдера — только для ПОКУПОК.
+            #
+            # Проверяем до всех сетевых запросов: пропуск ничего не стоит.
+            # Продажи не фильтруем: иначе при выходе трейдера частями бот
+            # пропускал бы мелкие продажи и оставался в рынке.
+            min_trade = Decimal(str(
+                getattr(user, "min_trader_trade_usdc", None) or 0
+            ))
+            if side == "BUY" and min_trade > 0:
+                trader_usdc = Decimal(str(trade_data.get("usdc_amount") or 0))
+                if trader_usdc < min_trade:
+                    logger.info(
+                        f"user={user_id}: покупка трейдера на "
+                        f"{trader_usdc:.2f} USDC меньше порога "
+                        f"{min_trade:.2f} — не копируем "
+                        f"({token_id[:12]}...)"
+                    )
+                    return
+
             amount = await self._calculate_amount(user)
             if amount <= 0:
                 logger.warning(f"amount=0 user={user_id}, skip trade")
@@ -1620,7 +1652,7 @@ class TraderService:
                     return
 
             # Если проверки подняли сумму до минимума рынка — берём её
-            bumped = self._bumped_amount.pop(token_id, None)
+            bumped = self._bumped_amount.pop((user_id, token_id), None)
             if bumped is not None and bumped > amount:
                 amount = bumped
 
@@ -1681,7 +1713,7 @@ class TraderService:
                 # Цена из стакана, уже полученная в проверках. Убирает
                 # повторный запрос стакана внутри SDK и служит защитой
                 # цены на стороне биржи.
-                limit_price=self._book_price_for(token_id),
+                limit_price=self._book_price_for(token_id, side),
             )
             ms_order = (time.monotonic() - t_phase) * 1000
             t_phase = time.monotonic()
