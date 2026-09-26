@@ -3,6 +3,8 @@ import time
 from decimal import Decimal
 from typing import Awaitable, Callable
 from loguru import logger
+
+from core.config import settings
 from sqlalchemy import select
 
 from core.database import async_session
@@ -12,44 +14,81 @@ from poly.ws_market import market_ws_manager
 
 
 
+def _positive(value) -> Decimal | None:
+    """
+    Цена, только если она реальная (> 0).
+
+    Когда покупателей в стакане нет, биржа передаёт лучший бид как "0".
+    Это НЕ цена — это отсутствие цены. Раньше бот читал "0" как "цена
+    упала до нуля": 0 меньше любого стоп-уровня, и стоп срабатывал. На
+    коротких рынках (5-минутные Up/Down) все заявки снимаются в момент
+    закрытия — поэтому ложные стопы шли ровно на границах пятиминуток,
+    по нескольку в одну секунду на разных рынках.
+    """
+    if value in (None, ""):
+        return None
+    try:
+        d = Decimal(str(value))
+    except Exception:
+        return None
+    return d if d > 0 else None
+
+
+def _bid_side_emptied(event: dict) -> bool:
+    """
+    Событие говорит, что покупателей в стакане НЕ ОСТАЛОСЬ.
+
+    Так бывает, когда стакан очищается целиком: на спортивных рынках
+    Polymarket по правилам снимает все лимитные ордера в момент начала
+    матча, у коротких рынков — при закрытии.
+    """
+    et = event.get("event_type")
+    if et == "best_bid_ask":
+        return event.get("best_bid") not in (None, "") and \
+            _positive(event.get("best_bid")) is None
+    if et == "price_change":
+        changes = event.get("price_changes") or []
+        bids = [ch.get("best_bid") for ch in changes
+                if ch.get("best_bid") not in (None, "")]
+        return bool(bids) and all(_positive(b) is None for b in bids)
+    if et == "book":
+        return not any(
+            _positive(b.get("price")) for b in event.get("bids") or []
+        )
+    return False
+
+
 def _extract_exit_price(event: dict) -> Decimal | None:
     """
     Цена, по которой мы РЕАЛЬНО смогли бы выйти из лонга — лучший бид.
-    Возвращает None, если событие не несёт информации о цене.
+    Возвращает None, если событие не несёт информации о цене — в том
+    числе когда покупателей нет вовсе (пустая сторона стакана).
     """
     et = event.get("event_type")
 
     if et == "best_bid_ask":
-        bid = event.get("best_bid")
-        return Decimal(str(bid)) if bid not in (None, "") else None
+        return _positive(event.get("best_bid"))
 
     if et == "price_change":
-        # В price_changes каждый элемент несёт актуальные best_bid/best_ask
         best = None
         for ch in event.get("price_changes") or []:
-            bid = ch.get("best_bid")
-            if bid in (None, ""):
+            val = _positive(ch.get("best_bid"))
+            if val is None:
                 continue
-            val = Decimal(str(bid))
             best = val if best is None else max(best, val)
         if best is not None:
             return best
-        bid = event.get("best_bid")
-        return Decimal(str(bid)) if bid not in (None, "") else None
+        return _positive(event.get("best_bid"))
 
     if et == "book":
-        bids = event.get("bids") or []
         prices = [
-            Decimal(str(b.get("price")))
-            for b in bids if b.get("price") not in (None, "")
+            p for p in (_positive(b.get("price")) for b in event.get("bids") or [])
+            if p is not None
         ]
         return max(prices) if prices else None
 
     if et == "last_trade_price":
-        # Оставляем как запасной сигнал: лучше, чем ничего, если по
-        # рынку не приходит книга.
-        p = event.get("price")
-        return Decimal(str(p)) if p not in (None, "") else None
+        return _positive(event.get("price"))
 
     return None
 
@@ -68,6 +107,8 @@ class TpSlMonitor:
         # Теперь каждая позиция получает свой обработчик, а WS-подписка
         # на токен разделяется между ними (см. ws_market: отписка
         # происходит только когда обработчиков не осталось).
+        # Когда стакан рынка был очищен (для паузы стоп-лосса)
+        self._book_cleared_at: dict[str, float] = {}
         self._handlers: dict[
             int, tuple[str, Callable[[dict], Awaitable[None]]]
         ] = {}
@@ -113,14 +154,45 @@ class TpSlMonitor:
                 await self._handle_market_resolved(position_id, event)
                 return
 
+            # Стакан очищен — запоминаем момент и ничего не делаем.
+            if _bid_side_emptied(event):
+                if token_id not in self._book_cleared_at:
+                    logger.info(
+                        f"Стакан {token_id[:12]}... очищен (начало матча "
+                        f"или закрытие рынка) — стоп-лосс ждёт "
+                        f"нормальных заявок"
+                    )
+                self._book_cleared_at[token_id] = time.monotonic()
+                return
+
             price = _extract_exit_price(event)
-            if price is not None:
-                await self._handle_price(position_id, price)
+            if price is None:
+                return
+
+            # ПАУЗА после очистки стакана.
+            #
+            # Сразу после того, как биржа сняла все заявки (на спорте —
+            # в момент начала матча), первые появившиеся заявки на
+            # покупку часто грабительские: кто-то ставит 0.01, надеясь
+            # поймать панику. Для стоп-лосса это выглядело бы как обвал,
+            # и бот продал бы по бросовой цене. Даём рынку время
+            # наполниться настоящими заявками.
+            cleared = self._book_cleared_at.get(token_id)
+            grace = getattr(settings, "book_clear_grace_seconds", 30)
+            if cleared is not None:
+                if time.monotonic() - cleared < grace:
+                    return
+                self._book_cleared_at.pop(token_id, None)
+
+            await self._handle_price(position_id, price)
 
         self._handlers[position_id] = (token_id, handler)
         await market_ws_manager.subscribe(token_id, handler)
 
     async def _handle_price(self, position_id: int, current_price: Decimal):
+        # Страховка: нулевая или отрицательная цена — не цена.
+        if current_price is None or current_price <= 0:
+            return
         # Момент, когда цена, пробившая уровень, дошла до бота
         triggered_at = time.monotonic()
         async with async_session() as session:
@@ -160,7 +232,20 @@ class TpSlMonitor:
             pos = await session.get(Position, position_id)
             if not pos or pos.status != "open":
                 return
-            won = event.get("winning_asset_id") == pos.token_id
+            winner = event.get("winning_asset_id")
+            if not winner:
+                # Поле отсутствует — НЕ решаем наугад. Ложный "проигрыш"
+                # так же плох, как ложный "выигрыш": пользователь увидит
+                # неверный итог. Позицию оставляем открытой, её подберёт
+                # сверка раз в минуту, где исход определяется по
+                # фактической итоговой цене.
+                logger.warning(
+                    f"market_resolved без winning_asset_id для позиции "
+                    f"{position_id} — исход определит сверка по цене"
+                )
+                return
+
+            won = winner == pos.token_id
             from services.trader import trader_service
             await trader_service.redeem_resolved_position(pos, won=won)
             await self.stop_watching_position(position_id)
@@ -215,23 +300,43 @@ class TpSlMonitor:
             redeemable = await polymarket_client.get_positions(
                 wallet, redeemable=True
             )
-            redeemable_assets = {p.asset for p in redeemable}
+            # Итоговая цена по каждому активу, а не просто факт
+            # "подлежит погашению".
+            #
+            # Раньше здесь стояло won=True БЕЗУСЛОВНО — для всего, что
+            # API вернул как redeemable. Но в этот список попадают и
+            # ПРОИГРАВШИЕ позиции: их тоже нужно погасить, просто
+            # выплата нулевая. В результате проигрыш объявлялся
+            # выигрышем, а при низкой цене входа проценты получались
+            # абсурдными: вход по 0.01 давал "+9900%", потому что
+            # доли считались погашенными по 1 USDC вместо 0.
+            redeemable_prices = {p.asset: p.cur_price for p in redeemable}
             user_positions = [p for p in open_positions if p.user_id == uid]
 
             for pos in user_positions:
-                if pos.token_id in redeemable_assets:
-                    logger.info(
-                        f"Reconciliation sweep: position {pos.id} "
-                        f"redeemable (fallback)"
-                    )
-                    async with async_session() as session:
-                        fresh = await session.get(Position, pos.id)
-                        if fresh and fresh.status == "open":
-                            from services.trader import trader_service
-                            await trader_service.redeem_resolved_position(
-                                fresh, won=True
-                            )
-                            await self.stop_watching_position(fresh.id)
+                if pos.token_id not in redeemable_prices:
+                    continue
+
+                settle_price = Decimal(
+                    str(redeemable_prices[pos.token_id] or 0)
+                )
+                # Разрешившийся рынок гасит выигравший токен около 1,
+                # проигравший около 0. Порог посередине.
+                won = settle_price >= Decimal("0.5")
+
+                logger.info(
+                    f"Reconciliation sweep: position {pos.id} "
+                    f"погашается, итоговая цена {settle_price} -> "
+                    f"{'выигрыш' if won else 'проигрыш'}"
+                )
+                async with async_session() as session:
+                    fresh = await session.get(Position, pos.id)
+                    if fresh and fresh.status == "open":
+                        from services.trader import trader_service
+                        await trader_service.redeem_resolved_position(
+                            fresh, won=won
+                        )
+                        await self.stop_watching_position(fresh.id)
 
 
 tp_sl_monitor = TpSlMonitor()
